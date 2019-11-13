@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -54,7 +55,9 @@ func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
 		response, err = db.PathQuery(request.Query, request.Params)
 	}
 	if err != nil {
-
+		w.WriteHeader(http.StatusInternalServerError)
+		log.Println(err)
+		fmt.Fprintf(w, err.Error())
 	} else {
 		json.NewEncoder(w).Encode(response)
 	}
