@@ -51,7 +51,13 @@ func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
 	var db *pathsqlx.DB
 	config, err := ReadConfig()
 	if err == nil {
-		db, err = pathsqlx.Create(config.Username, config.Password, config.Database, config.Driver, config.Address, config.Port)
+		username := config.Username
+		password := config.Password
+		if user, pass, ok := req.BasicAuth(); ok {
+			username = user
+			password = pass
+		}
+		db, err = pathsqlx.Create(username, password, config.Database, config.Driver, config.Address, config.Port)
 	}
 	if err == nil {
 		err = json.NewDecoder(req.Body).Decode(&request)
