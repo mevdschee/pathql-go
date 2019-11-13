@@ -2,17 +2,17 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
-	"os"
 
 	"github.com/BurntSushi/toml"
 	"github.com/gorilla/mux"
 	"github.com/mevdschee/pathsqlx"
+
+	_ "github.com/lib/pq"
 )
 
-// Config contains the database configuration
+// Config contains all configuration
 type Config struct {
 	Username string
 	Password string
@@ -23,44 +23,48 @@ type Config struct {
 }
 
 // ReadConfig reads info from config file
-func ReadConfig() Config {
+func ReadConfig() (Config, error) {
 	var configfile = "config.ini"
-	_, err := os.Stat(configfile)
-	if err != nil {
-		log.Fatal("Config file is missing: ", configfile)
-	}
 	var config Config
 	if _, err := toml.DecodeFile(configfile, &config); err != nil {
-		log.Fatal(err)
+		return config, err
 	}
-	return config
+	return config, nil
 }
 
 // Request is the data structure posted to the /pathql endpoint
 type Request struct {
-	Query  string      `json:"query,omitempty"`
-	Params interface{} `json:"params,omitempty"`
+	Query  string      `json:"query"`
+	Params interface{} `json:"params"`
+}
+
+// ErrorResponse is the data structure used to report pathql errors
+type ErrorResponse struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
 }
 
 // PathQlEndpoint handles POST to /pathql
 func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
-	var request Request
-	var response interface{}
-	config := ReadConfig()
-	db, err := pathsqlx.Create(config.Username, config.Password, config.Database, config.Driver, config.Address, config.Port)
-	if err != nil {
+	request := Request{}
+	var response interface{} = nil
+	var db *pathsqlx.DB
+	config, err := ReadConfig()
+	if err == nil {
+		db, err = pathsqlx.Create(config.Username, config.Password, config.Database, config.Driver, config.Address, config.Port)
+	}
+	if err == nil {
 		err = json.NewDecoder(req.Body).Decode(&request)
 	}
-	if err != nil {
+	if err == nil {
 		response, err = db.PathQuery(request.Query, request.Params)
 	}
+	w.Header().Set("Content-Type", "application/json")
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
-		log.Println(err)
-		fmt.Fprintf(w, err.Error())
-	} else {
-		json.NewEncoder(w).Encode(response)
+		response = ErrorResponse{"Error", err.Error()}
 	}
+	json.NewEncoder(w).Encode(response)
 }
 
 func main() {
