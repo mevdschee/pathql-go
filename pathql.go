@@ -61,7 +61,12 @@ func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
 			json.NewEncoder(w).Encode(response)
 			return
 		}
-		response, err = db.PathQuery(request.Query, request.Params)
+		// Convert nil params to empty map for sqlx compatibility
+		params := request.Params
+		if params == nil {
+			params = map[string]interface{}{}
+		}
+		response, err = db.PathQuery(request.Query, params)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	if err != nil {
