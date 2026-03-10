@@ -53,6 +53,14 @@ func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
 		err = json.NewDecoder(req.Body).Decode(&request)
 	}
 	if err == nil {
+		// Reject slice/array params - only maps are supported
+		if _, ok := request.Params.([]interface{}); ok {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			response = ErrorResponse{"Error", "params must be an object, not an array"}
+			json.NewEncoder(w).Encode(response)
+			return
+		}
 		response, err = db.PathQuery(request.Query, request.Params)
 	}
 	w.Header().Set("Content-Type", "application/json")
