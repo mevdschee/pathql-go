@@ -2,8 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
+	"regexp"
+	"strings"
 
 	"github.com/BurntSushi/toml"
 	"github.com/gorilla/mux"
@@ -30,8 +33,9 @@ func ReadConfig() (Config, error) {
 
 // Request is the data structure posted to the /pathql endpoint
 type Request struct {
-	Query  string      `json:"query"`
-	Params interface{} `json:"params"`
+	Query     string                 `json:"query"`
+	Params    interface{}            `json:"params"`
+	Variables map[string]interface{} `json:"variables"`
 }
 
 // ErrorResponse is the data structure used to report pathql errors
@@ -40,18 +44,93 @@ type ErrorResponse struct {
 	Message string `json:"message"`
 }
 
+// DSNVariable represents a variable in the DSN template
+type DSNVariable struct {
+	Name         string
+	DefaultValue string
+	HasDefault   bool
+}
+
+// ParseDSNVariables extracts all variables from a DSN template
+func ParseDSNVariables(dsn string) []DSNVariable {
+	re := regexp.MustCompile(`\{([^}]+)\}`)
+	matches := re.FindAllStringSubmatch(dsn, -1)
+
+	var variables []DSNVariable
+	for _, match := range matches {
+		varSpec := match[1]
+		parts := strings.SplitN(varSpec, ":", 2)
+
+		variable := DSNVariable{
+			Name:       parts[0],
+			HasDefault: len(parts) > 1,
+		}
+
+		if variable.HasDefault {
+			variable.DefaultValue = parts[1]
+		}
+
+		variables = append(variables, variable)
+	}
+
+	return variables
+}
+
+// ReplaceDSNVariables replaces variables in the DSN with actual values
+func ReplaceDSNVariables(dsn string, variables map[string]interface{}) (string, error) {
+	dsnVars := ParseDSNVariables(dsn)
+	result := dsn
+
+	for _, dsnVar := range dsnVars {
+		// Check if variable is provided
+		value, provided := variables[dsnVar.Name]
+
+		if !provided {
+			if dsnVar.HasDefault {
+				// Use default value
+				result = strings.Replace(result, fmt.Sprintf("{%s:%s}", dsnVar.Name, dsnVar.DefaultValue), dsnVar.DefaultValue, -1)
+			} else {
+				// Required variable is missing
+				return "", fmt.Errorf("missing required DSN variable: %s", dsnVar.Name)
+			}
+		} else {
+			// Use provided value
+			valueStr := fmt.Sprintf("%v", value)
+			// Replace both {var} and {var:default} formats
+			if dsnVar.HasDefault {
+				result = strings.Replace(result, fmt.Sprintf("{%s:%s}", dsnVar.Name, dsnVar.DefaultValue), valueStr, -1)
+			} else {
+				result = strings.Replace(result, fmt.Sprintf("{%s}", dsnVar.Name), valueStr, -1)
+			}
+		}
+	}
+
+	return result, nil
+}
+
 // PathQlEndpoint handles POST to /pathql
 func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
 	request := Request{}
 	var response interface{} = nil
 	var db *pathsqlx.DB
 	config, err := ReadConfig()
-	if err == nil {
-		db, err = pathsqlx.Connect(config.Driver, config.DSN)
-	}
+
 	if err == nil {
 		err = json.NewDecoder(req.Body).Decode(&request)
 	}
+
+	if err == nil {
+		// Replace DSN variables if any
+		if request.Variables == nil {
+			request.Variables = make(map[string]interface{})
+		}
+		config.DSN, err = ReplaceDSNVariables(config.DSN, request.Variables)
+	}
+
+	if err == nil {
+		db, err = pathsqlx.Connect(config.Driver, config.DSN)
+	}
+
 	if err == nil {
 		// Reject slice/array params - only maps are supported
 		if _, ok := request.Params.([]interface{}); ok {
