@@ -1,0 +1,205 @@
+openapi: 3.0.3
+info:
+  title: PathQL API
+  description: |
+    PathQL is a REST API that allows executing SQL queries via HTTP POST requests.
+    It supports parameterized queries and dynamic DSN variable substitution for flexible
+    database connections.
+  version: 1.0.0
+  contact:
+    name: PathQL
+    url: https://github.com/mevdschee/pathql-go
+
+servers:
+  - url: http://localhost:8000
+    description: Local development server
+
+paths:
+  /pathql:
+    post:
+      summary: Execute a PathQL query
+      description: |
+        Executes a SQL query against the configured database. Supports parameterized queries
+        and dynamic DSN variables for connection string customization.
+
+        ## DSN Variables
+
+        DSN variables can be specified in the config file using the format `{variableName}`
+        or `{variableName:defaultValue}`.
+
+        - Variables without defaults are required and must be provided in the request
+        - Variables with defaults are optional and will use the default if not provided
+        - Variable names are case-sensitive and must match exactly
+
+        ## Query Parameters
+
+        Query parameters are used for SQL parameterization and follow the sqlx named parameter
+        format. Parameters must be provided as an object (not an array).
+      operationId: executeQuery
+      tags:
+        - Query Execution
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryRequest"
+            examples:
+              simpleQuery:
+                summary: Simple query without parameters
+                value:
+                  query: "SELECT 1 AS a, 2 AS b"
+                  variables:
+                    username: "pathql"
+                    password: "pathql"
+              parameterizedQuery:
+                summary: Query with parameters
+                value:
+                  query: "SELECT * FROM users WHERE id = :userId AND status = :status"
+                  params:
+                    userId: 123
+                    status: "active"
+                  variables:
+                    username: "pathql"
+                    password: "pathql"
+              customConnection:
+                summary: Query with custom DSN variables
+                value:
+                  query: "SELECT current_database() AS db"
+                  variables:
+                    host: "db.example.com"
+                    port: "5432"
+                    username: "admin"
+                    password: "secret"
+                    dbname: "production"
+      responses:
+        "200":
+          description: Query executed successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryResponse"
+              examples:
+                singleRow:
+                  summary: Single row result
+                  value:
+                    - a: 1
+                      b: 2
+                multipleRows:
+                  summary: Multiple rows result
+                  value:
+                    - id: 1
+                      name: "Alice"
+                      email: "alice@example.com"
+                    - id: 2
+                      name: "Bob"
+                      email: "bob@example.com"
+                emptyResult:
+                  summary: Empty result set
+                  value: []
+        "400":
+          description: Bad request (e.g., invalid parameters format)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                invalidParams:
+                  summary: Invalid params type
+                  value:
+                    type: "Error"
+                    message: "params must be an object, not an array"
+        "500":
+          description: Server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              examples:
+                missingVariable:
+                  summary: Missing required DSN variable
+                  value:
+                    type: "Error"
+                    message: "missing required DSN variable: username"
+                sqlError:
+                  summary: SQL execution error
+                  value:
+                    type: "Error"
+                    message: "pq: syntax error at or near \"SELEC\""
+                connectionError:
+                  summary: Database connection error
+                  value:
+                    type: "Error"
+                    message: "dial tcp: lookup invalid-host: no such host"
+
+components:
+  schemas:
+    QueryRequest:
+      type: object
+      required:
+        - query
+      properties:
+        query:
+          type: string
+          description: |
+            SQL query to execute. Supports named parameters using the `:paramName` syntax.
+          example: "SELECT * FROM users WHERE id = :userId"
+        params:
+          type: object
+          description: |
+            Named parameters for the SQL query. Must be an object (not an array).
+            Keys should match the parameter names in the query (without the colon).
+          additionalProperties: true
+          example:
+            userId: 123
+            status: "active"
+        variables:
+          type: object
+          description: |
+            DSN variables for database connection customization. Variable names must
+            match exactly (case-sensitive) with the variables defined in the DSN template.
+
+            Required variables (without defaults in DSN) must be provided.
+            Optional variables (with defaults in DSN) can be omitted.
+          additionalProperties: true
+          example:
+            username: "pathql"
+            password: "pathql"
+            host: "localhost"
+            port: "5432"
+            dbname: "pathql"
+
+    QueryResponse:
+      type: array
+      description: |
+        Array of result objects. Each object represents a row from the query result.
+        The structure depends on the columns returned by the query.
+      items:
+        type: object
+        additionalProperties: true
+      example:
+        - id: 1
+          name: "Alice"
+          email: "alice@example.com"
+        - id: 2
+          name: "Bob"
+          email: "bob@example.com"
+
+    ErrorResponse:
+      type: object
+      required:
+        - type
+        - message
+      properties:
+        type:
+          type: string
+          description: Error type identifier
+          example: "Error"
+        message:
+          type: string
+          description: Human-readable error message
+          example: "missing required DSN variable: username"
+
+tags:
+  - name: Query Execution
+    description: Endpoints for executing SQL queries
