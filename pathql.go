@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"regexp"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/gorilla/mux"
@@ -19,9 +22,47 @@ var config Config
 
 // Config contains all configuration
 type Config struct {
-	Driver string
-	DSN    string
-	Listen string
+	Driver  string
+	DSN     string
+	Listen  string
+	Verbose bool
+}
+
+// Metrics holds request metrics
+type Metrics struct {
+	status200 uint64
+	status400 uint64
+	status500 uint64
+	statusOther uint64
+	latencyLt1ms     uint64
+	latencyLt5ms     uint64
+	latencyLt10ms    uint64
+	latencyLt50ms    uint64
+	latencyLt100ms   uint64
+	latencyLt500ms   uint64
+	latencyLt1000ms  uint64
+	latencyLt5000ms  uint64
+	latencyLt10000ms uint64
+	latencyGte10000ms uint64
+}
+
+var metrics Metrics
+
+// responseWriter wraps http.ResponseWriter to capture status code and response size
+type responseWriter struct {
+	http.ResponseWriter
+	statusCode int
+	body       bytes.Buffer
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+func (rw *responseWriter) Write(b []byte) (int, error) {
+	rw.body.Write(b)
+	return rw.ResponseWriter.Write(b)
 }
 
 // ReadConfig reads info from config file
@@ -39,6 +80,7 @@ type Request struct {
 	Query     string                 `json:"query"`
 	Params    interface{}            `json:"params"`
 	Variables map[string]interface{} `json:"variables"`
+	Paths     map[string]string      `json:"paths"`
 }
 
 // ErrorResponse is the data structure used to report pathql errors
@@ -111,6 +153,93 @@ func ReplaceDSNVariables(dsn string, variables map[string]interface{}) (string, 
 	return result, nil
 }
 
+// metricsMiddleware tracks request metrics and logs in verbose mode
+func metricsMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rw := &responseWriter{
+			ResponseWriter: w,
+			statusCode:     200,
+		}
+
+		next(rw, r)
+
+		duration := time.Since(start).Milliseconds()
+
+		// Track status code
+		switch rw.statusCode {
+		case 200:
+			atomic.AddUint64(&metrics.status200, 1)
+		case 400:
+			atomic.AddUint64(&metrics.status400, 1)
+		case 500:
+			atomic.AddUint64(&metrics.status500, 1)
+		default:
+			atomic.AddUint64(&metrics.statusOther, 1)
+		}
+
+		// Track latency bracket
+		switch {
+		case duration < 1:
+			atomic.AddUint64(&metrics.latencyLt1ms, 1)
+		case duration < 5:
+			atomic.AddUint64(&metrics.latencyLt5ms, 1)
+		case duration < 10:
+			atomic.AddUint64(&metrics.latencyLt10ms, 1)
+		case duration < 50:
+			atomic.AddUint64(&metrics.latencyLt50ms, 1)
+		case duration < 100:
+			atomic.AddUint64(&metrics.latencyLt100ms, 1)
+		case duration < 500:
+			atomic.AddUint64(&metrics.latencyLt500ms, 1)
+		case duration < 1000:
+			atomic.AddUint64(&metrics.latencyLt1000ms, 1)
+		case duration < 5000:
+			atomic.AddUint64(&metrics.latencyLt5000ms, 1)
+		case duration < 10000:
+			atomic.AddUint64(&metrics.latencyLt10000ms, 1)
+		default:
+			atomic.AddUint64(&metrics.latencyGte10000ms, 1)
+		}
+
+		// Verbose logging
+		if config.Verbose {
+			log.Printf("%s %d %d %dms\n",
+				time.Now().Format(time.RFC3339),
+				rw.statusCode,
+				rw.body.Len(),
+				duration)
+		}
+	}
+}
+
+// MetricsEndpoint handles GET to /metrics
+func MetricsEndpoint(w http.ResponseWriter, req *http.Request) {
+	response := map[string]interface{}{
+		"status_codes": map[string]uint64{
+			"200":   atomic.LoadUint64(&metrics.status200),
+			"400":   atomic.LoadUint64(&metrics.status400),
+			"500":   atomic.LoadUint64(&metrics.status500),
+			"other": atomic.LoadUint64(&metrics.statusOther),
+		},
+		"latency_ms": map[string]uint64{
+			"<1":      atomic.LoadUint64(&metrics.latencyLt1ms),
+			"<5":      atomic.LoadUint64(&metrics.latencyLt5ms),
+			"<10":     atomic.LoadUint64(&metrics.latencyLt10ms),
+			"<50":     atomic.LoadUint64(&metrics.latencyLt50ms),
+			"<100":    atomic.LoadUint64(&metrics.latencyLt100ms),
+			"<500":    atomic.LoadUint64(&metrics.latencyLt500ms),
+			"<1000":   atomic.LoadUint64(&metrics.latencyLt1000ms),
+			"<5000":   atomic.LoadUint64(&metrics.latencyLt5000ms),
+			"<10000":  atomic.LoadUint64(&metrics.latencyLt10000ms),
+			">=10000": atomic.LoadUint64(&metrics.latencyGte10000ms),
+		},
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(response)
+}
+
 // PathQlEndpoint handles POST to /pathql
 func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
 	request := Request{}
@@ -147,7 +276,16 @@ func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
 		if params == nil {
 			params = map[string]interface{}{}
 		}
-		response, err = db.PathQuery(request.Query, params)
+		
+		// Append PATH hints if provided
+		query := request.Query
+		if len(request.Paths) > 0 {
+			for alias, path := range request.Paths {
+				query += fmt.Sprintf(" -- PATH %s %s", alias, path)
+			}
+		}
+		
+		response, err = db.PathQuery(query, params)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	if err != nil {
@@ -170,6 +308,7 @@ func main() {
 	}
 
 	router := mux.NewRouter()
-	router.HandleFunc("/pathql", PathQlEndpoint).Methods("POST")
+	router.HandleFunc("/pathql", metricsMiddleware(PathQlEndpoint)).Methods("POST")
+	router.HandleFunc("/metrics", MetricsEndpoint).Methods("GET")
 	log.Fatal(http.ListenAndServe(config.Listen, router))
 }
