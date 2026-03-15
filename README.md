@@ -2,21 +2,28 @@
 
 PathQL implementation in Go using Mux (see: [PathQL.org](https://pathql.org/)).
 
-PathQL lets you write SQL queries that automatically produce nested JSON from flat SQL result rows. The nesting structure is inferred from table aliases and foreign key metadata, with optional SQL comment hints for overrides.
+PathQL lets you write SQL queries that automatically produce nested JSON from
+flat SQL result rows. The nesting structure is inferred from table aliases and
+foreign key metadata, with optional SQL comment hints for overrides.
 
 ## How it works
 
-You send a POST request to `/pathql` with a JSON body containing a SQL query and optional parameters. The [pathsqlx](https://github.com/mevdschee/pathsqlx) engine automatically determines the JSON structure by:
+You send a POST request to `/pathql` with a JSON body containing a SQL query and
+optional parameters. The [pathsqlx](https://github.com/mevdschee/pathsqlx)
+engine automatically determines the JSON structure by:
 
 1. **Parsing the query** to identify tables, aliases, and joins.
-2. **Detecting cardinality** using foreign key metadata (one-to-many vs many-to-one).
+2. **Detecting cardinality** using foreign key metadata (one-to-many vs
+   many-to-one).
 3. **Generating JSON paths** for each column based on the query structure.
 
-If automatic inference isn't sufficient, you can use **PATH hints** (SQL comments) to override the structure.
+If automatic inference isn't sufficient, you can use **PATH hints** (SQL
+comments) to override the structure.
 
 ### PATH hints
 
-PATH hints are SQL comments that override the automatic path inference for a table alias:
+PATH hints are SQL comments that override the automatic path inference for a
+table alias:
 
 ```sql
 -- PATH alias $.path
@@ -34,7 +41,12 @@ Create a `config.ini` file in the project root:
 ```ini
 Driver = "postgres"
 DSN    = "host=localhost port=5432 user=your_user password=your_password dbname=your_database sslmode=disable"
+Listen = ":8000"
 ```
+
+The `Listen` parameter is optional and defaults to `:8000` if not specified. You
+can change it to bind to a different port or address (e.g., `":9000"` or
+`"127.0.0.1:8000"`).
 
 ## Running
 
@@ -43,20 +55,22 @@ go build -o pathql-go
 ./pathql-go
 ```
 
-The server starts on port 8000 and exposes a single endpoint: `POST /pathql`.
+The server starts on the configured listen address (default `:8000`) and exposes
+a single endpoint: `POST /pathql`.
 
 ## Request format
 
 ```json
 {
   "query": "SELECT id, content FROM posts WHERE id = :id",
-  "params": {"id": 1}
+  "params": { "id": 1 }
 }
 ```
 
 ## Examples
 
-The examples below are based on a database with `posts`, `comments`, and `categories` tables.
+The examples below are based on a database with `posts`, `comments`, and
+`categories` tables.
 
 ### Simple query — flat array
 
@@ -65,14 +79,14 @@ The examples below are based on a database with `posts`, `comments`, and `catego
 ```json
 {
   "query": "SELECT id, content FROM posts WHERE id = :id",
-  "params": {"id": 1}
+  "params": { "id": 1 }
 }
 ```
 
 **Response:**
 
 ```json
-[{"id": 1, "content": "blog started"}]
+[{ "id": 1, "content": "blog started" }]
 ```
 
 ### Multiple records
@@ -89,12 +103,13 @@ The examples below are based on a database with `posts`, `comments`, and `catego
 **Response:**
 
 ```json
-[{"id": 1}, {"id": 2}]
+[{ "id": 1 }, { "id": 2 }]
 ```
 
 ### Join with automatic inference — posts with comments
 
-Using table aliases (`p`, `c`), pathsqlx automatically detects the one-to-many relationship via foreign keys and nests comments under each post:
+Using table aliases (`p`, `c`), pathsqlx automatically detects the one-to-many
+relationship via foreign keys and nests comments under each post:
 
 **Request:**
 
@@ -109,8 +124,14 @@ Using table aliases (`p`, `c`), pathsqlx automatically detects the one-to-many r
 
 ```json
 [
-  {"p": {"id": 1}, "c": [{"id": 1, "message": "great!"}, {"id": 2, "message": "nice!"}]},
-  {"p": {"id": 2}, "c": [{"id": 3, "message": "interesting"}, {"id": 4, "message": "cool"}]}
+  {
+    "p": { "id": 1 },
+    "c": [{ "id": 1, "message": "great!" }, { "id": 2, "message": "nice!" }]
+  },
+  {
+    "p": { "id": 2 },
+    "c": [{ "id": 3, "message": "interesting" }, { "id": 4, "message": "cool" }]
+  }
 ]
 ```
 
@@ -132,8 +153,8 @@ Using a PATH hint to control the root structure:
 ```json
 {
   "posts": [
-    {"id": 1, "comments": [{"id": 1}, {"id": 2}]},
-    {"id": 2, "comments": [{"id": 3}, {"id": 4}]}
+    { "id": 1, "comments": [{ "id": 1 }, { "id": 2 }] },
+    { "id": 2, "comments": [{ "id": 3 }, { "id": 4 }] }
   ]
 }
 ```
@@ -152,7 +173,7 @@ Using a PATH hint to control the root structure:
 **Response:**
 
 ```json
-{"posts": 2}
+{ "posts": 2 }
 ```
 
 ### PATH hint — nested statistics object
@@ -169,7 +190,7 @@ Using a PATH hint to control the root structure:
 **Response:**
 
 ```json
-{"statistics": {"posts": 2}}
+{ "statistics": { "posts": 2 } }
 ```
 
 ### PATH hint — multiple scalar counts
@@ -186,7 +207,7 @@ Using a PATH hint to control the root structure:
 **Response:**
 
 ```json
-{"statistics": {"posts": 2, "comments": 4}}
+{ "statistics": { "posts": 2, "comments": 4 } }
 ```
 
 ### Group by
@@ -204,8 +225,8 @@ Using a PATH hint to control the root structure:
 
 ```json
 [
-  {"name": "announcement", "post_count": 2},
-  {"name": "article", "post_count": 1}
+  { "name": "announcement", "post_count": 2 },
+  { "name": "article", "post_count": 1 }
 ]
 ```
 

@@ -15,10 +15,13 @@ import (
 	_ "github.com/lib/pq"
 )
 
+var config Config
+
 // Config contains all configuration
 type Config struct {
 	Driver string
 	DSN    string
+	Listen string
 }
 
 // ReadConfig reads info from config file
@@ -113,22 +116,21 @@ func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
 	request := Request{}
 	var response interface{} = nil
 	var db *pathsqlx.DB
-	config, err := ReadConfig()
+	var err error
 
-	if err == nil {
-		err = json.NewDecoder(req.Body).Decode(&request)
-	}
+	err = json.NewDecoder(req.Body).Decode(&request)
 
+	var dsn string
 	if err == nil {
 		// Replace DSN variables if any
 		if request.Variables == nil {
 			request.Variables = make(map[string]interface{})
 		}
-		config.DSN, err = ReplaceDSNVariables(config.DSN, request.Variables)
+		dsn, err = ReplaceDSNVariables(config.DSN, request.Variables)
 	}
 
 	if err == nil {
-		db, err = pathsqlx.Connect(config.Driver, config.DSN)
+		db, err = pathsqlx.Connect(config.Driver, dsn)
 	}
 
 	if err == nil {
@@ -156,7 +158,18 @@ func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
 }
 
 func main() {
+	var err error
+	config, err = ReadConfig()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Default to :8000 if Listen is not specified
+	if config.Listen == "" {
+		config.Listen = ":8000"
+	}
+
 	router := mux.NewRouter()
 	router.HandleFunc("/pathql", PathQlEndpoint).Methods("POST")
-	log.Fatal(http.ListenAndServe(":8000", router))
+	log.Fatal(http.ListenAndServe(config.Listen, router))
 }
