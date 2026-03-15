@@ -30,19 +30,19 @@ type Config struct {
 
 // Metrics holds request metrics
 type Metrics struct {
-	status200 uint64
-	status400 uint64
-	status500 uint64
-	statusOther uint64
-	latencyLt1ms     uint64
-	latencyLt5ms     uint64
-	latencyLt10ms    uint64
-	latencyLt50ms    uint64
-	latencyLt100ms   uint64
-	latencyLt500ms   uint64
-	latencyLt1000ms  uint64
-	latencyLt5000ms  uint64
-	latencyLt10000ms uint64
+	status200         uint64
+	status400         uint64
+	status500         uint64
+	statusOther       uint64
+	latencyLt1ms      uint64
+	latencyLt5ms      uint64
+	latencyLt10ms     uint64
+	latencyLt50ms     uint64
+	latencyLt100ms    uint64
+	latencyLt500ms    uint64
+	latencyLt1000ms   uint64
+	latencyLt5000ms   uint64
+	latencyLt10000ms  uint64
 	latencyGte10000ms uint64
 }
 
@@ -276,7 +276,7 @@ func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
 		if params == nil {
 			params = map[string]interface{}{}
 		}
-		
+
 		// Append PATH hints if provided
 		query := request.Query
 		if len(request.Paths) > 0 {
@@ -284,7 +284,7 @@ func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
 				query += fmt.Sprintf(" -- PATH %s %s", alias, path)
 			}
 		}
-		
+
 		response, err = db.PathQuery(query, params)
 	}
 	w.Header().Set("Content-Type", "application/json")
