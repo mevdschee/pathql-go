@@ -77,10 +77,10 @@ func ReadConfig() (Config, error) {
 
 // Request is the data structure posted to the /pathql endpoint
 type Request struct {
-	Query     string                 `json:"query"`
-	Params    interface{}            `json:"params"`
-	Variables map[string]interface{} `json:"variables"`
-	Paths     map[string]string      `json:"paths"`
+	Query     string            `json:"query"`
+	Params    any               `json:"params"`
+	Variables map[string]any    `json:"variables"`
+	Paths     map[string]string `json:"paths"`
 }
 
 // ErrorResponse is the data structure used to report pathql errors
@@ -122,7 +122,7 @@ func ParseDSNVariables(dsn string) []DSNVariable {
 }
 
 // ReplaceDSNVariables replaces variables in the DSN with actual values
-func ReplaceDSNVariables(dsn string, variables map[string]interface{}) (string, error) {
+func ReplaceDSNVariables(dsn string, variables map[string]any) (string, error) {
 	dsnVars := ParseDSNVariables(dsn)
 	result := dsn
 
@@ -215,7 +215,7 @@ func metricsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 
 // MetricsEndpoint handles GET to /metrics
 func MetricsEndpoint(w http.ResponseWriter, req *http.Request) {
-	response := map[string]interface{}{
+	response := map[string]any{
 		"status_codes": map[string]uint64{
 			"200":   atomic.LoadUint64(&metrics.status200),
 			"400":   atomic.LoadUint64(&metrics.status400),
@@ -243,7 +243,7 @@ func MetricsEndpoint(w http.ResponseWriter, req *http.Request) {
 // PathQlEndpoint handles POST to /pathql
 func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
 	request := Request{}
-	var response interface{} = nil
+	var response any = nil
 	var db *pathsqlx.DB
 	var err error
 
@@ -253,7 +253,7 @@ func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
 	if err == nil {
 		// Replace DSN variables if any
 		if request.Variables == nil {
-			request.Variables = make(map[string]interface{})
+			request.Variables = make(map[string]any)
 		}
 		dsn, err = ReplaceDSNVariables(config.DSN, request.Variables)
 	}
@@ -266,7 +266,7 @@ func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
 		query := request.Query
 
 		// Reject slice/array params - only maps are supported
-		if _, ok := request.Params.([]interface{}); ok {
+		if _, ok := request.Params.([]any); ok {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
 			response = ErrorResponse{"Error", "params must be an object, not an array"}
@@ -276,7 +276,7 @@ func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
 		// Convert nil params to empty map for sqlx compatibility
 		params := request.Params
 		if params == nil {
-			params = map[string]interface{}{}
+			params = map[string]any{}
 		}
 
 		// Convert nil paths to empty map for sqlx compatibility
