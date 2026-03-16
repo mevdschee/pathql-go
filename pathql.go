@@ -14,8 +14,6 @@ import (
 	"github.com/BurntSushi/toml"
 	"github.com/gorilla/mux"
 	"github.com/mevdschee/pathsqlx"
-
-	_ "github.com/lib/pq"
 )
 
 var config Config
