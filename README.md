@@ -1,6 +1,6 @@
 # pathql-server
 
-PathQL implementation in Go using Mux (see: [PathQL.org](https://pathql.org/)).
+PathQL server implementation in Go using Mux (see: [PathQL.org](https://pathql.org/)).
 
 PathQL lets you write SQL queries that automatically produce nested JSON from
 flat SQL result rows. The nesting structure is inferred from table aliases and
