@@ -35,8 +35,8 @@ hints using the `paths` parameter in the request body:
 
 PATH hint format:
 
-- **`alias`** — the table alias (or `$` for queries without a real table)
-- **`$.path`** — the JSON path for that table's columns
+- **`alias`**: the table alias (or `$` for queries without a real table)
+- **`$.path`**: the JSON path for that table's columns
 - If the path ends with `[]`, it's an array; otherwise, it's an object
 - `$` alone means the root is a single object
 
@@ -53,10 +53,10 @@ Verbose = false
 
 Configuration options:
 
-- **`Driver`** — Database driver (e.g., `"postgres"`)
-- **`DSN`** — Database connection string
-- **`Listen`** — Server listen address (optional, defaults to `:8000`)
-- **`Verbose`** — Enable verbose logging (optional, defaults to `false`). When
+- **`Driver`**: Database driver (e.g., `"postgres"`)
+- **`DSN`**: Database connection string
+- **`Listen`**: Server listen address (optional, defaults to `:8000`)
+- **`Verbose`**: Enable verbose logging (optional, defaults to `false`). When
   enabled, logs timestamp, status code, response size, and latency for each
   request to stdout
 
@@ -70,8 +70,8 @@ go build -o pathql-server
 The server starts on the configured listen address (default `:8000`) and exposes
 two endpoints:
 
-- `POST /pathql` — Execute PathQL queries
-- `GET /metrics` — View request metrics (status codes and latency distribution)
+- `POST /pathql`: Execute PathQL queries
+- `GET /metrics`: View request metrics (status codes and latency distribution)
 
 ## Request format
 
@@ -86,12 +86,12 @@ two endpoints:
 
 Request parameters:
 
-- **`query`** (required) — SQL query string
-- **`params`** (optional) — Named parameters for the query (must be an object,
+- **`query`** (required): SQL query string
+- **`params`** (optional): Named parameters for the query (must be an object,
   not an array)
-- **`variables`** (optional) — DSN template variables for dynamic database
+- **`variables`** (optional): DSN template variables for dynamic database
   connection
-- **`paths`** (optional) — PATH hints to override automatic JSON path inference.
+- **`paths`** (optional): PATH hints to override automatic JSON path inference.
   Each key is a table alias, and each value is the JSON path (e.g.,
   `{"p": "$", "c": "$.comments[]"}`)
 
@@ -130,7 +130,7 @@ access.
 The examples below are based on a database with `posts`, `comments`, and
 `categories` tables.
 
-### Simple query — flat array
+### Simple query: flat array
 
 **Request:**
 
@@ -164,7 +164,7 @@ The examples below are based on a database with `posts`, `comments`, and
 [{ "id": 1 }, { "id": 2 }]
 ```
 
-### Join with automatic inference — posts with comments
+### Join with automatic inference: posts with comments
 
 Using table aliases (`p`, `c`), pathsqlx automatically detects the one-to-many
 relationship via foreign keys and nests comments under each post:
@@ -193,7 +193,7 @@ relationship via foreign keys and nests comments under each post:
 ]
 ```
 
-### PATH hint — nested posts with comments
+### PATH hint: nested posts with comments
 
 Using a PATH hint to control the root structure:
 
@@ -218,7 +218,7 @@ Using a PATH hint to control the root structure:
 }
 ```
 
-### PATH hint — count as object
+### PATH hint: count as object
 
 **Request:**
 
@@ -236,7 +236,7 @@ Using a PATH hint to control the root structure:
 { "posts": 2 }
 ```
 
-### PATH hint — nested statistics object
+### PATH hint: nested statistics object
 
 **Request:**
 
@@ -254,7 +254,7 @@ Using a PATH hint to control the root structure:
 { "statistics": { "posts": 2 } }
 ```
 
-### PATH hint — multiple scalar counts
+### PATH hint: multiple scalar counts
 
 **Request:**
 
