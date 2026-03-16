@@ -263,6 +263,8 @@ func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
 	}
 
 	if err == nil {
+		query := request.Query
+
 		// Reject slice/array params - only maps are supported
 		if _, ok := request.Params.([]interface{}); ok {
 			w.Header().Set("Content-Type", "application/json")
@@ -277,15 +279,13 @@ func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
 			params = map[string]interface{}{}
 		}
 
-		// Append PATH hints if provided
-		query := request.Query
-		if len(request.Paths) > 0 {
-			for alias, path := range request.Paths {
-				query += fmt.Sprintf(" -- PATH %s %s", alias, path)
-			}
+		// Convert nil paths to empty map for sqlx compatibility
+		paths := request.Paths
+		if paths == nil {
+			paths = map[string]string{}
 		}
 
-		response, err = db.PathQuery(query, params)
+		response, err = db.PathQuery(query, params, paths)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	if err != nil {
