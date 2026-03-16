@@ -63,8 +63,8 @@ Configuration options:
 ## Running
 
 ```sh
-go build -o pathql-go
-./pathql-go
+go build -o pathql-server
+./pathql-server
 ```
 
 The server starts on the configured listen address (default `:8000`) and exposes
