@@ -118,12 +118,21 @@ The `/metrics` endpoint returns JSON with request statistics:
     "<5000": 0,
     "<10000": 0,
     ">=10000": 0
-  }
+  },
+  "top_queries": [
+    {"query": "SELECT * FROM users WHERE id = :id", "count": 18234},
+    {"query": "SELECT * FROM posts", "count": 9120}
+  ]
 }
 ```
 
-Metrics are tracked using atomic 64-bit counters and are safe for concurrent
-access.
+Status codes and latency buckets are tracked using atomic 64-bit counters and
+are safe for concurrent access.
+
+`top_queries` lists the most frequently run queries. It uses the Space-Saving
+algorithm, which keeps a bounded set of counters (up to 1000 distinct queries)
+and evicts the least frequent when full, so memory stays bounded regardless of
+how many distinct queries the server sees.
 
 ## Examples
 

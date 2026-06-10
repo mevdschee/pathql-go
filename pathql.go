@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -45,6 +48,84 @@ type Metrics struct {
 }
 
 var metrics Metrics
+
+// topQueriesCapacity bounds how many distinct queries the toplist tracks.
+// Memory use is bounded to this many query strings regardless of traffic.
+const topQueriesCapacity = 1000
+
+// QueryCount is one entry in the queries toplist.
+type QueryCount struct {
+	Query string `json:"query"`
+	Count uint64 `json:"count"`
+}
+
+// TopQueries tracks the most frequently run queries using the Space-Saving
+// algorithm (Metwally et al., 2005). It keeps at most `capacity` counters; when
+// a new query arrives and every slot is taken, the slot with the lowest count
+// is evicted and the new query inherits that count + 1. This yields an accurate
+// top-K in bounded memory without storing every distinct query.
+type TopQueries struct {
+	mu       sync.Mutex
+	capacity int
+	counts   map[string]uint64
+}
+
+// NewTopQueries returns a Space-Saving tracker holding up to capacity counters.
+func NewTopQueries(capacity int) *TopQueries {
+	return &TopQueries{
+		capacity: capacity,
+		counts:   make(map[string]uint64, capacity),
+	}
+}
+
+// Record counts one occurrence of query.
+func (t *TopQueries) Record(query string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if _, ok := t.counts[query]; ok {
+		t.counts[query]++
+		return
+	}
+	if len(t.counts) < t.capacity {
+		t.counts[query] = 1
+		return
+	}
+
+	// All slots full: evict the minimum-count query and let the new one take
+	// its place, inheriting min+1. The linear scan is O(capacity); fine for a
+	// metrics feature, swap in a stream-summary list if it ever gets hot.
+	var minQuery string
+	var minCount uint64 = math.MaxUint64
+	for q, c := range t.counts {
+		if c < minCount {
+			minCount = c
+			minQuery = q
+		}
+	}
+	delete(t.counts, minQuery)
+	t.counts[query] = minCount + 1
+}
+
+// Top returns the n most frequent queries, highest count first.
+func (t *TopQueries) Top(n int) []QueryCount {
+	t.mu.Lock()
+	list := make([]QueryCount, 0, len(t.counts))
+	for q, c := range t.counts {
+		list = append(list, QueryCount{Query: q, Count: c})
+	}
+	t.mu.Unlock()
+
+	sort.Slice(list, func(i, j int) bool {
+		return list[i].Count > list[j].Count
+	})
+	if len(list) > n {
+		list = list[:n]
+	}
+	return list
+}
+
+var topQueries = NewTopQueries(topQueriesCapacity)
 
 // responseWriter wraps http.ResponseWriter to capture status code and response size
 type responseWriter struct {
@@ -232,6 +313,7 @@ func MetricsEndpoint(w http.ResponseWriter, req *http.Request) {
 			"<10000":  atomic.LoadUint64(&metrics.latencyLt10000ms),
 			">=10000": atomic.LoadUint64(&metrics.latencyGte10000ms),
 		},
+		"top_queries": topQueries.Top(10),
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -246,6 +328,10 @@ func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
 	var err error
 
 	err = json.NewDecoder(req.Body).Decode(&request)
+
+	if err == nil && request.Query != "" {
+		topQueries.Record(request.Query)
+	}
 
 	var dsn string
 	if err == nil {
