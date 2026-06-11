@@ -7,22 +7,22 @@ import (
 
 func TestTopQueriesRecordAndTop(t *testing.T) {
 	tq := NewTopQueries(10)
-	tq.Record("a")
-	tq.Record("a")
-	tq.Record("a")
-	tq.Record("b")
-	tq.Record("b")
-	tq.Record("c")
+	tq.Record("a", 10)
+	tq.Record("a", 20) // a: count 2, total 30
+	tq.Record("b", 5)
+	tq.Record("b", 5)  // b: count 2, total 10
+	tq.Record("c", 50) // c: count 1, total 50
 
 	top := tq.Top(10)
 	if len(top) != 3 {
 		t.Fatalf("expected 3 distinct queries, got %d", len(top))
 	}
 
-	expected := []QueryCount{
-		{Query: "a", Count: 3},
-		{Query: "b", Count: 2},
-		{Query: "c", Count: 1},
+	// Ranked by accumulated duration, slowest total first.
+	expected := []QueryStat{
+		{Query: "c", Count: 1, TotalMs: 50},
+		{Query: "a", Count: 2, TotalMs: 30},
+		{Query: "b", Count: 2, TotalMs: 10},
 	}
 	for i, want := range expected {
 		if top[i] != want {
@@ -33,15 +33,9 @@ func TestTopQueriesRecordAndTop(t *testing.T) {
 
 func TestTopQueriesTopLimitsResults(t *testing.T) {
 	tq := NewTopQueries(10)
-	for i := 0; i < 5; i++ {
-		tq.Record("a")
-	}
-	for i := 0; i < 4; i++ {
-		tq.Record("b")
-	}
-	for i := 0; i < 3; i++ {
-		tq.Record("c")
-	}
+	tq.Record("a", 100)
+	tq.Record("b", 50)
+	tq.Record("c", 10)
 
 	top := tq.Top(2)
 	if len(top) != 2 {
@@ -52,19 +46,15 @@ func TestTopQueriesTopLimitsResults(t *testing.T) {
 	}
 }
 
-func TestTopQueriesSortedByCountDescending(t *testing.T) {
+func TestTopQueriesSortedByDurationDescending(t *testing.T) {
 	tq := NewTopQueries(10)
-	tq.Record("low")
-	for i := 0; i < 7; i++ {
-		tq.Record("high")
-	}
-	for i := 0; i < 3; i++ {
-		tq.Record("mid")
-	}
+	tq.Record("low", 3)
+	tq.Record("high", 70)
+	tq.Record("mid", 25)
 
 	top := tq.Top(10)
 	for i := 1; i < len(top); i++ {
-		if top[i-1].Count < top[i].Count {
+		if top[i-1].TotalMs < top[i].TotalMs {
 			t.Errorf("not sorted descending: %+v before %+v", top[i-1], top[i])
 		}
 	}
@@ -76,7 +66,7 @@ func TestTopQueriesCapacityBound(t *testing.T) {
 	const capacity = 5
 	tq := NewTopQueries(capacity)
 	for i := 0; i < 1000; i++ {
-		tq.Record(string(rune('a' + i%26)))
+		tq.Record(string(rune('a'+i%26)), uint64(i%7))
 	}
 
 	top := tq.Top(1000)
@@ -85,70 +75,70 @@ func TestTopQueriesCapacityBound(t *testing.T) {
 	}
 }
 
-// TestTopQueriesEvictionInheritsMinCount verifies the Space-Saving rule: when
-// every slot is full, the minimum-count query is evicted and the incoming query
-// inherits min+1.
-func TestTopQueriesEvictionInheritsMinCount(t *testing.T) {
+// TestTopQueriesEvictionInheritsMinDuration verifies the Space-Saving rule: when
+// every slot is full, the entry with the lowest accumulated duration is evicted
+// and the incoming query inherits its count and duration totals.
+func TestTopQueriesEvictionInheritsMinDuration(t *testing.T) {
 	tq := NewTopQueries(2)
-	tq.Record("a")
-	tq.Record("a")
-	tq.Record("a") // a -> 3
-	tq.Record("b") // b -> 1, slots now full
+	tq.Record("a", 30)
+	tq.Record("b", 5) // slots now full, b has the lowest duration
 
-	tq.Record("c") // full: evict b (min=1), c inherits 1+1=2
+	tq.Record("c", 10) // evict b (total 5), c inherits 5+10=15, count 1+1=2
 
 	top := tq.Top(2)
 	if len(top) != 2 {
 		t.Fatalf("expected 2 tracked queries, got %d", len(top))
 	}
 
-	got := map[string]uint64{}
-	for _, qc := range top {
-		got[qc.Query] = qc.Count
+	got := map[string]QueryStat{}
+	for _, qs := range top {
+		got[qs.Query] = qs
 	}
-	if got["a"] != 3 {
-		t.Errorf("expected a=3, got %d", got["a"])
+	if a := got["a"]; a.Count != 1 || a.TotalMs != 30 {
+		t.Errorf("expected a{count:1, total:30}, got %+v", a)
 	}
-	if got["c"] != 2 {
-		t.Errorf("expected c=2 (inherited min+1), got %d", got["c"])
+	if c := got["c"]; c.Count != 2 || c.TotalMs != 15 {
+		t.Errorf("expected c{count:2, total:15} (inherited from b), got %+v", c)
 	}
 	if _, ok := got["b"]; ok {
 		t.Errorf("expected b to be evicted, but it is still tracked")
 	}
 }
 
-// TestTopQueriesHeavyHitterRetained verifies the core Space-Saving guarantee: a
-// query that occurs far more often than total/capacity is never evicted, and its
-// reported count is at least its true frequency.
-func TestTopQueriesHeavyHitterRetained(t *testing.T) {
+// TestTopQueriesHeavyDurationHitterRetained verifies the core Space-Saving
+// guarantee: a query that accumulates far more duration than the others is never
+// evicted, and its reported total is at least its true accumulated duration.
+func TestTopQueriesHeavyDurationHitterRetained(t *testing.T) {
 	tq := NewTopQueries(3)
-	const hotHits = 100
+	const hits = 100
+	const slowMs = 100
 
-	for i := 0; i < hotHits; i++ {
-		tq.Record("hot")
-		// Interleave a stream of unique cold queries to pressure eviction.
-		tq.Record("cold-" + string(rune(i)))
+	for i := 0; i < hits; i++ {
+		tq.Record("slow", slowMs)
+		// Interleave a stream of unique fast queries to pressure eviction.
+		tq.Record("fast-"+string(rune(i)), 1)
 	}
 
 	top := tq.Top(1)
 	if len(top) == 0 {
 		t.Fatal("expected at least one tracked query")
 	}
-	if top[0].Query != "hot" {
-		t.Errorf("expected hot query on top, got %q", top[0].Query)
+	if top[0].Query != "slow" {
+		t.Errorf("expected slow query on top, got %q", top[0].Query)
 	}
-	if top[0].Count < hotHits {
-		t.Errorf("expected hot count >= %d (Space-Saving never underestimates), got %d", hotHits, top[0].Count)
+	if top[0].TotalMs < hits*slowMs {
+		t.Errorf("expected slow total_ms >= %d (Space-Saving never underestimates), got %d", hits*slowMs, top[0].TotalMs)
 	}
 }
 
 // TestTopQueriesConcurrentRecord exercises the mutex under concurrent writers.
 // Keeping the distinct-query set within capacity means no eviction occurs, so
-// the counts must sum exactly to the number of Record calls. Run with -race.
+// both the counts and durations must sum exactly. Run with -race.
 func TestTopQueriesConcurrentRecord(t *testing.T) {
 	tq := NewTopQueries(10)
 	const goroutines = 8
 	const perGoroutine = 1000
+	const durationMs = 2
 
 	var wg sync.WaitGroup
 	for g := 0; g < goroutines; g++ {
@@ -156,18 +146,22 @@ func TestTopQueriesConcurrentRecord(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < perGoroutine; i++ {
-				tq.Record(string(rune('a' + i%5)))
+				tq.Record(string(rune('a'+i%5)), durationMs)
 			}
 		}()
 	}
 	wg.Wait()
 
-	var total uint64
-	for _, qc := range tq.Top(10) {
-		total += qc.Count
+	var totalCount, totalMs uint64
+	for _, qs := range tq.Top(10) {
+		totalCount += qs.Count
+		totalMs += qs.TotalMs
 	}
-	want := uint64(goroutines * perGoroutine)
-	if total != want {
-		t.Errorf("expected total count %d, got %d", want, total)
+	wantCount := uint64(goroutines * perGoroutine)
+	if totalCount != wantCount {
+		t.Errorf("expected total count %d, got %d", wantCount, totalCount)
+	}
+	if wantMs := wantCount * durationMs; totalMs != wantMs {
+		t.Errorf("expected total_ms %d, got %d", wantMs, totalMs)
 	}
 }

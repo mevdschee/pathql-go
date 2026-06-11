@@ -53,71 +53,88 @@ var metrics Metrics
 // Memory use is bounded to this many query strings regardless of traffic.
 const topQueriesCapacity = 1000
 
-// QueryCount is one entry in the queries toplist.
-type QueryCount struct {
-	Query string `json:"query"`
-	Count uint64 `json:"count"`
+// QueryStat is one entry in the queries toplist: how often a query ran and the
+// total time spent running it.
+type QueryStat struct {
+	Query   string `json:"query"`
+	Count   uint64 `json:"count"`
+	TotalMs uint64 `json:"total_ms"`
 }
 
-// TopQueries tracks the most frequently run queries using the Space-Saving
-// algorithm (Metwally et al., 2005). It keeps at most `capacity` counters; when
-// a new query arrives and every slot is taken, the slot with the lowest count
-// is evicted and the new query inherits that count + 1. This yields an accurate
-// top-K in bounded memory without storing every distinct query.
+// queryStat is the internal mutable counter pair for one tracked query.
+type queryStat struct {
+	count   uint64
+	totalMs uint64
+}
+
+// TopQueries tracks the queries that consume the most total time using the
+// Space-Saving algorithm (Metwally et al., 2005). It keeps at most `capacity`
+// entries; when a new query arrives and every slot is taken, the slot with the
+// lowest accumulated duration is evicted and the new query inherits that slot's
+// totals so a heavy hitter can't be underreported. This yields an accurate
+// top-K by total duration in bounded memory without storing every distinct query.
 type TopQueries struct {
 	mu       sync.Mutex
 	capacity int
-	counts   map[string]uint64
+	stats    map[string]*queryStat
 }
 
-// NewTopQueries returns a Space-Saving tracker holding up to capacity counters.
+// NewTopQueries returns a Space-Saving tracker holding up to capacity entries.
 func NewTopQueries(capacity int) *TopQueries {
 	return &TopQueries{
 		capacity: capacity,
-		counts:   make(map[string]uint64, capacity),
+		stats:    make(map[string]*queryStat, capacity),
 	}
 }
 
-// Record counts one occurrence of query.
-func (t *TopQueries) Record(query string) {
+// Record adds one occurrence of query taking durationMs milliseconds.
+func (t *TopQueries) Record(query string, durationMs uint64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	if _, ok := t.counts[query]; ok {
-		t.counts[query]++
+	if s, ok := t.stats[query]; ok {
+		s.count++
+		s.totalMs += durationMs
 		return
 	}
-	if len(t.counts) < t.capacity {
-		t.counts[query] = 1
+	if len(t.stats) < t.capacity {
+		t.stats[query] = &queryStat{count: 1, totalMs: durationMs}
 		return
 	}
 
-	// All slots full: evict the minimum-count query and let the new one take
-	// its place, inheriting min+1. The linear scan is O(capacity); fine for a
-	// metrics feature, swap in a stream-summary list if it ever gets hot.
+	// All slots full: evict the query with the lowest accumulated duration (the
+	// value the toplist ranks by) and let the new one take its place, inheriting
+	// the evicted totals so a heavy hitter can't be underreported. The linear
+	// scan is O(capacity); fine for a metrics feature, swap in a stream-summary
+	// list if it ever gets hot.
 	var minQuery string
-	var minCount uint64 = math.MaxUint64
-	for q, c := range t.counts {
-		if c < minCount {
-			minCount = c
+	var minTotalMs uint64 = math.MaxUint64
+	for q, s := range t.stats {
+		if s.totalMs < minTotalMs {
+			minTotalMs = s.totalMs
 			minQuery = q
 		}
 	}
-	delete(t.counts, minQuery)
-	t.counts[query] = minCount + 1
+	evicted := t.stats[minQuery]
+	delete(t.stats, minQuery)
+	t.stats[query] = &queryStat{
+		count:   evicted.count + 1,
+		totalMs: evicted.totalMs + durationMs,
+	}
 }
 
-// Top returns the n most frequent queries, highest count first.
-func (t *TopQueries) Top(n int) []QueryCount {
+// Top returns the n queries with the highest accumulated duration, slowest
+// total first.
+func (t *TopQueries) Top(n int) []QueryStat {
 	t.mu.Lock()
-	list := make([]QueryCount, 0, len(t.counts))
-	for q, c := range t.counts {
-		list = append(list, QueryCount{Query: q, Count: c})
+	list := make([]QueryStat, 0, len(t.stats))
+	for q, s := range t.stats {
+		list = append(list, QueryStat{Query: q, Count: s.count, TotalMs: s.totalMs})
 	}
 	t.mu.Unlock()
 
 	sort.Slice(list, func(i, j int) bool {
-		return list[i].Count > list[j].Count
+		return list[i].TotalMs > list[j].TotalMs
 	})
 	if len(list) > n {
 		list = list[:n]
@@ -322,6 +339,7 @@ func MetricsEndpoint(w http.ResponseWriter, req *http.Request) {
 
 // PathQlEndpoint handles POST to /pathql
 func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
+	start := time.Now()
 	request := Request{}
 	var response any = nil
 	var db *pathsqlx.DB
@@ -330,7 +348,9 @@ func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
 	err = json.NewDecoder(req.Body).Decode(&request)
 
 	if err == nil && request.Query != "" {
-		topQueries.Record(request.Query)
+		defer func() {
+			topQueries.Record(request.Query, uint64(time.Since(start).Milliseconds()))
+		}()
 	}
 
 	var dsn string
