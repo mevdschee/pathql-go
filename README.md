@@ -178,7 +178,8 @@ The examples below are based on a database with `posts`, `comments`, and
 ### Join with automatic inference: posts with comments
 
 Using table aliases (`p`, `c`), pathsqlx automatically detects the one-to-many
-relationship via foreign keys and nests comments under each post:
+relationship via foreign keys. Each result row holds the post under `p` and its
+comments as a sibling `c` array, grouped per post:
 
 **Request:**
 
@@ -297,11 +298,11 @@ Using a PATH hint to control the root structure:
 **Response:**
 
 ```json
-[
-  { "name": "announcement", "post_count": 2 },
-  { "name": "article", "post_count": 1 }
-]
+[{ "name": "announcement", "post_count": 2 }]
 ```
+
+Only `announcement` appears: both posts belong to it, and the inner join
+excludes `article`, which has no posts.
 
 ## License
 
