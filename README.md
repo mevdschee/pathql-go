@@ -714,10 +714,11 @@ prompt answer; the [IP firewall](#ip-firewall), if configured, still applies.
 ## Schema reflection
 
 `GET /schema` returns the tables, columns, primary keys and foreign keys the
-caller can read, rendered as [DBML](https://dbml.dbdiagram.io/) by the bundled
-dbml-tools introspection, so a client can discover what to query (table names,
-columns, and the foreign-key relationships PathQL nests on) without any write
-access or DDL. The response is `text/plain` DBML:
+caller can read, rendered as [DBML](https://dbml.dbdiagram.io/) by the
+[dbml-tools](https://github.com/mevdschee/dbml-tools) library, so a client can
+discover what to query (table names, columns, and the foreign-key relationships
+PathQL nests on) without any write access or DDL. The response is `text/plain`
+DBML:
 
 ```dbml
 Project {

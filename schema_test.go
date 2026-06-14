@@ -5,7 +5,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"dbml-tools/introspect"
+	"github.com/mevdschee/dbml-tools/introspect"
 
 	"github.com/mevdschee/pathql-go/internal/config"
 )

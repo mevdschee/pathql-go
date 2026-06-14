@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"time"
 
-	"dbml-tools/introspect"
+	"github.com/mevdschee/dbml-tools/introspect"
 
 	"github.com/mevdschee/pathql-go/internal/auth"
 	"github.com/mevdschee/pathql-go/internal/cache"
