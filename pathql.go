@@ -25,6 +25,7 @@ import (
 	"github.com/mevdschee/pathql-go/internal/db"
 	"github.com/mevdschee/pathql-go/internal/middleware"
 	"github.com/mevdschee/pathql-go/internal/roles"
+	"github.com/mevdschee/pathql-go/internal/sqlgate"
 )
 
 // cfg holds the loaded server configuration.
@@ -402,6 +403,14 @@ func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	// Optional SQL gate: when enabled, reject queries outside the read-only,
+	// single-statement, no-system-catalog policy before any database work. The
+	// rejection reason describes the request shape, so it is safe to return.
+	if err := sqlgate.Check(request.Query, sqlgate.Mode(cfg.Security.SQLGate)); err != nil {
+		writeError(w, req, http.StatusBadRequest, err.Error(), err)
+		return
+	}
+
 	// Convert nil params to empty map for sqlx compatibility.
 	params := request.Params
 	if params == nil {
@@ -439,34 +448,22 @@ func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
 		IdleInTxTimeout:  statementTimeout,
 		WorkMemKB:        cfg.Limits.WorkMemKB,
 	}
+	// Proactive cost ceiling via EXPLAIN. PostgreSQL only (the plan JSON and the
+	// EXPLAIN syntax are Postgres-specific), so only enable it for that driver.
+	if cfg.Driver == "postgres" {
+		opts.MaxEstimatedCost = cfg.Limits.MaxEstimatedCost
+		opts.MaxEstimatedRows = cfg.Limits.MaxEstimatedRows
+	}
 
 	// Select the connection by identity model. With identity_kind "none" the
 	// shared pool serves every query and there is no per-caller RLS binding. With
 	// "login_role" the query runs on a connection authenticated as the caller's
 	// own database role, so RLS policies see an unforgeable current_user.
-	queryPool := pool
-	if cfg.Security.IdentityKind == "login_role" {
-		if principal == nil {
-			writeError(w, req, http.StatusUnauthorized, "authentication required", nil)
-			return
-		}
-		role, nameErr := roles.RoleName(cfg.Roles.Prefix, principal.UserID)
-		if nameErr != nil {
-			writeError(w, req, http.StatusInternalServerError, genericInternalError, nameErr)
-			return
-		}
-		rp, release, acqErr := rolePools.Acquire(ctx, role)
-		if acqErr != nil {
-			if errors.Is(acqErr, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				writeError(w, req, http.StatusServiceUnavailable, "server busy", acqErr)
-				return
-			}
-			writeError(w, req, http.StatusInternalServerError, genericInternalError, acqErr)
-			return
-		}
-		defer release()
-		queryPool = rp
+	queryPool, release, ok := selectQueryPool(ctx, w, req, principal)
+	if !ok {
+		return
 	}
+	defer release()
 
 	response, err := db.RunQuery(ctx, queryPool, request.Query, params, paths, opts)
 	if err != nil {
@@ -475,6 +472,13 @@ func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
 		// server-side only, never returned to the client.
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			writeError(w, req, http.StatusServiceUnavailable, "query timed out", err)
+			return
+		}
+		// Proactive cost ceiling rejected the query before running it. Generic
+		// client message (the estimate/limit detail is logged server-side via the
+		// wrapped cause, not returned, so data volume is not disclosed).
+		if errors.Is(err, db.ErrQueryTooExpensive) {
+			writeError(w, req, http.StatusBadRequest, "query rejected: estimated cost or row count exceeds the configured limit", err)
 			return
 		}
 		writeError(w, req, http.StatusInternalServerError, genericInternalError, err)
@@ -495,6 +499,37 @@ func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_, _ = w.Write(buf.Bytes())
+}
+
+// selectQueryPool returns the database pool a caller's read should run on under
+// the configured identity model, plus a release func to call when the work is
+// done (a no-op in shared mode). With identity_kind "none" it is the shared pool
+// and there is no per-caller binding; with "login_role" it is the caller's own
+// per-role pool, acquired against ctx, so RLS policies see an unforgeable
+// current_user. On failure it writes the HTTP error itself and returns ok=false.
+func selectQueryPool(ctx context.Context, w http.ResponseWriter, req *http.Request, principal *auth.Principal) (queryPool *pathsqlx.DB, release func(), ok bool) {
+	if cfg.Security.IdentityKind != "login_role" {
+		return pool, func() {}, true
+	}
+	if principal == nil {
+		writeError(w, req, http.StatusUnauthorized, "authentication required", nil)
+		return nil, nil, false
+	}
+	role, nameErr := roles.RoleName(cfg.Roles.Prefix, principal.UserID)
+	if nameErr != nil {
+		writeError(w, req, http.StatusInternalServerError, genericInternalError, nameErr)
+		return nil, nil, false
+	}
+	rp, rel, acqErr := rolePools.Acquire(ctx, role)
+	if acqErr != nil {
+		if errors.Is(acqErr, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			writeError(w, req, http.StatusServiceUnavailable, "server busy", acqErr)
+			return nil, nil, false
+		}
+		writeError(w, req, http.StatusInternalServerError, genericInternalError, acqErr)
+		return nil, nil, false
+	}
+	return rp, rel, true
 }
 
 // buildAuthChain builds the authentication chain from the configured methods.
@@ -570,6 +605,7 @@ func publicHandler(c *config.Config, chain *auth.Chain, theCache cache.Cache, tr
 	h = middleware.GlobalInflight(c.Limits.MaxConcurrentGlobal)(h)
 	h = middleware.BodyLimit(c.Limits.MaxBodyBytes)(h)
 	h = middleware.RequireContentTypeJSON(h)
+	h = middleware.XSRF(c.Security.XSRF == "on")(h)
 	h = middleware.RequestID(h)
 	h = middleware.CORS(c.CORS.AllowedOrigins)(h)
 	if c.TLS.Enabled && c.TLS.HSTS {
@@ -681,6 +717,17 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// Optional IP firewall: allow/deny CIDR lists gating every route. Parsed once
+	// here; the config validated the entries, so parsing cannot fail.
+	firewallAllow, err := middleware.ParseTrustedProxies(cfg.Security.AllowIPs)
+	if err != nil {
+		log.Fatal(err)
+	}
+	firewallDeny, err := middleware.ParseTrustedProxies(cfg.Security.DenyIPs)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	// Open the database connections. With identity_kind "none" a single shared
 	// pool (the top-level dsn) serves every request and there is no RLS isolation.
 	// With "login_role", rolePools serves caller queries on per-role connections
@@ -753,6 +800,10 @@ func main() {
 	router := http.NewServeMux()
 	router.Handle("POST /pathql", pathqlH)
 	router.Handle("OPTIONS /pathql", pathqlH)
+	router.Handle("GET /health", healthHandler(newHealthChecker(pool)))
+	schemaH := schemaHandler(cfg, chain, sharedCache, trustedProxies)
+	router.Handle("GET /schema", schemaH)
+	router.Handle("OPTIONS /schema", schemaH)
 	router.Handle("GET /metrics", metricsHandler(cfg, chain, sharedCache, trustedProxies))
 	router.Handle("POST /admin/users", adminHandler(cfg, chain, sharedCache, trustedProxies, adminAddUser))
 	router.Handle("DELETE /admin/users/{id}", adminHandler(cfg, chain, sharedCache, trustedProxies, adminDeleteUser))
@@ -762,9 +813,13 @@ func main() {
 	writeTimeout := time.Duration(cfg.Timeouts.WriteMs) * time.Millisecond
 	idleTimeout := time.Duration(cfg.Timeouts.IdleMs) * time.Millisecond
 
+	// The IP firewall wraps the whole router so it gates every route uniformly
+	// (a no-op passthrough when no allow/deny lists are configured).
+	rootHandler := middleware.Firewall(firewallAllow, firewallDeny, trustedProxies)(router)
+
 	publicSrv := &http.Server{
 		Addr:         cfg.Listen,
-		Handler:      router,
+		Handler:      rootHandler,
 		ReadTimeout:  readTimeout,
 		WriteTimeout: writeTimeout,
 		IdleTimeout:  idleTimeout,
@@ -851,7 +906,11 @@ func runStartupChecks(c *config.Config, pool *pathsqlx.DB) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	dbChecked := true
-	rep, err := db.VerifyHardening(ctx, pool, c.Driver, c.Security.AuthTablePrefix)
+	// A readable table without RLS is a silent full-table exposure only where RLS
+	// is the boundary, so escalate it to critical (aborting under enforce) just
+	// for login_role; in "none" mode the shared role intentionally sees all rows.
+	noRLSIsCritical := c.Security.StartupChecks == "enforce" && c.Security.IdentityKind == "login_role"
+	rep, err := db.VerifyHardening(ctx, pool, c.Driver, c.Security.AuthTablePrefix, noRLSIsCritical)
 	if err != nil {
 		log.Printf("WARNING: startup hardening check could not run: %v", err)
 		dbChecked = false

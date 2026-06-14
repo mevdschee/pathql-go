@@ -125,7 +125,10 @@ paths:
                   summary: Empty result set
                   value: []
         "400":
-          description: Bad request (malformed body, bad params, or multiple statements)
+          description: >
+            Bad request: malformed body, bad params, a SQL-gate rejection, or a
+            query rejected by the proactive cost ceiling (its EXPLAIN estimate
+            exceeded max_estimated_cost / max_estimated_rows).
           content:
             application/json:
               schema:
@@ -146,6 +149,11 @@ paths:
                   value:
                     type: "Error"
                     message: "only a single statement is allowed"
+                costCeiling:
+                  summary: Query rejected by the cost ceiling
+                  value:
+                    type: "Error"
+                    message: "query rejected: estimated cost or row count exceeds the configured limit"
         "401":
           description: Missing or invalid credentials
           headers:
@@ -234,6 +242,99 @@ paths:
                   value:
                     type: "Error"
                     message: "query timed out"
+
+  /health:
+    get:
+      summary: Readiness probe
+      description: |
+        Unauthenticated readiness check for load balancers and orchestrators.
+        Returns 200 when the database answered a recent ping and 503 when it did
+        not, so traffic is kept away until the database is reachable. The
+        reachability result is cached for about a second, so frequent probes do
+        not amplify load onto the database.
+      operationId: health
+      tags: [Operations]
+      security: []
+      responses:
+        "200":
+          description: The server is up and the database is reachable.
+          content:
+            application/json:
+              example: { status: "ok", database: "up" }
+        "503":
+          description: The database is not currently reachable.
+          content:
+            application/json:
+              example: { status: "unavailable", database: "down" }
+
+  /schema:
+    get:
+      summary: Reflect the database schema as DBML
+      description: |
+        Returns the tables, columns, primary keys and foreign keys the
+        authenticated caller's database role can read, rendered as DBML
+        (https://dbml.dbdiagram.io/). It is read-only and PostgreSQL-only. In
+        login_role mode the reflection runs on the caller's own connection, so
+        PostgreSQL's information_schema naturally restricts the output to the
+        tables that role was granted. Authenticated like `/pathql`; the metrics
+        and admin principals are forbidden.
+      operationId: schema
+      tags: [Schema]
+      responses:
+        "200":
+          description: The schema as DBML text.
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: |
+                Project {
+                  database_type: 'PostgreSQL'
+                }
+
+                Table "posts" {
+                  "id" bigint [pk, not null]
+                  "category_id" bigint [not null]
+                  "content" text
+                }
+
+                Ref: "posts"."category_id" > "categories"."id"
+        "401":
+          description: Missing or invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                type: "Error"
+                message: "unauthorized"
+        "403":
+          description: Authenticated but not authorized (the metrics or admin principal).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                type: "Error"
+                message: "forbidden"
+        "501":
+          description: Schema reflection is only available for the postgres driver.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                type: "Error"
+                message: "schema reflection is only available for the postgres driver"
+        "503":
+          description: Server busy or the reflection query timed out.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                type: "Error"
+                message: "query timed out"
 
   /metrics:
     get:
@@ -448,6 +549,10 @@ components:
 tags:
   - name: Query Execution
     description: Endpoints for executing SQL queries
+  - name: Schema
+    description: Read-only schema reflection rendered as DBML
+  - name: Operations
+    description: Unauthenticated operational probes (health)
   - name: Metrics
     description: Operational metrics, restricted to the metrics principal
   - name: Admin

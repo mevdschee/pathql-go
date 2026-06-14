@@ -38,6 +38,7 @@ func adminHandler(c *config.Config, chain *auth.Chain, theCache cache.Cache, tru
 	handler = middleware.GlobalInflight(c.Limits.MaxConcurrentGlobal)(handler)
 	handler = middleware.BodyLimit(c.Limits.MaxBodyBytes)(handler)
 	handler = middleware.RequireContentTypeJSON(handler)
+	handler = middleware.XSRF(c.Security.XSRF == "on")(handler)
 	handler = middleware.RequestID(handler)
 	if c.TLS.Enabled && c.TLS.HSTS {
 		handler = middleware.HSTS(handler)

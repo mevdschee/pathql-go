@@ -5,12 +5,15 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
+
+	"github.com/mevdschee/pathql-go/internal/sqlgate"
 )
 
 // Config is the top-level server configuration.
@@ -48,13 +51,20 @@ type Security struct {
 	AuthTablePrefix string   `toml:"auth_table_prefix"` // default "pathql_auth_"
 	ReadOnly        bool     `toml:"read_only"`
 	TrustedProxies  []string `toml:"trusted_proxies"`
+	// AllowIPs and DenyIPs are the optional IP firewall lists (CIDRs or bare IPs),
+	// evaluated against the resolved client IP for every route. A request from a
+	// DenyIPs address is rejected with 403; if AllowIPs is non-empty, only its
+	// addresses are admitted (default-deny). Both empty disables the firewall.
+	AllowIPs []string `toml:"allow_ips"`
+	DenyIPs  []string `toml:"deny_ips"`
 	// MetricsUser is the app_user identity allowed to read GET /metrics on the
 	// main listener; that principal may ONLY read metrics. Empty disables the
 	// metrics endpoint entirely (fail closed). Default "metrics".
 	MetricsUser string `toml:"metrics_user"`
 	// StartupChecks controls the database hardening self-check run at startup:
 	// "off" skips it, "warn" (default) logs findings, "enforce" refuses to start
-	// on a critical finding (superuser role or write privileges).
+	// on a critical finding (a superuser or BYPASSRLS role, write privileges, or
+	// - under login_role - a readable table with no row-level security).
 	StartupChecks string `toml:"startup_checks"`
 	// IdentityKind selects the connection model and whether row-level security
 	// applies:
@@ -70,6 +80,18 @@ type Security struct {
 	// AdminUser is the app_user identity allowed on the /admin/* routes; that
 	// principal may only use admin routes. Empty disables them (fail closed).
 	AdminUser string `toml:"admin_user"`
+	// SQLGate is the optional pre-execution SQL validator (internal/sqlgate):
+	// "off" (default) accepts any query; "on" rejects queries that are not a
+	// single read-only statement over non-catalog objects (no stacked
+	// statements, no SET/SHOW/EXPLAIN/COPY/DDL/DML, no pg_*/information_schema).
+	// It is defense in depth on top of the read-only transaction and the grants.
+	// The value is a string so stricter modes can be added later.
+	SQLGate string `toml:"sql_gate"`
+	// XSRF enables double-submit-cookie CSRF protection: "off" (default) or "on".
+	// When "on", state-changing requests (POST/PUT/PATCH/DELETE) must echo the
+	// XSRF-TOKEN cookie in an X-XSRF-TOKEN header. Defense in depth for browser
+	// deployments that authenticate with cookies or HTTP Basic.
+	XSRF string `toml:"xsrf"`
 }
 
 // Auth selects the enabled authentication methods.
@@ -102,6 +124,13 @@ type Limits struct {
 	// query so a single sort/hash cannot consume unbounded memory. 0 leaves the
 	// server default. Default 0.
 	WorkMemKB int `toml:"work_mem_kb"`
+	// MaxEstimatedCost, when > 0, makes the server EXPLAIN each query first and
+	// reject (400) one whose PostgreSQL planner estimated total cost exceeds this.
+	// 0 disables. PostgreSQL only.
+	MaxEstimatedCost float64 `toml:"max_estimated_cost"`
+	// MaxEstimatedRows, when > 0, rejects a query whose planner estimated output
+	// row count exceeds this (same EXPLAIN pre-check). 0 disables. PostgreSQL only.
+	MaxEstimatedRows int64 `toml:"max_estimated_rows"`
 }
 
 // Cache configures the in-process abuse-protection / JWKS cache. The cache is
@@ -258,6 +287,12 @@ func (c *Config) applyDefaults() {
 	if c.Security.IdentityKind == "" {
 		c.Security.IdentityKind = "none"
 	}
+	if c.Security.SQLGate == "" {
+		c.Security.SQLGate = "off"
+	}
+	if c.Security.XSRF == "" {
+		c.Security.XSRF = "off"
+	}
 
 	if c.Roles.BaselineRole == "" {
 		c.Roles.BaselineRole = "pathql_auth"
@@ -322,6 +357,26 @@ func (c *Config) applyDefaults() {
 	}
 }
 
+// validateIPList checks that every non-empty entry in a firewall list is a valid
+// CIDR or bare IP, so a typo fails closed at startup rather than silently
+// admitting or blocking traffic. name is the config key, used in the error.
+func validateIPList(name string, entries []string) error {
+	for _, raw := range entries {
+		s := strings.TrimSpace(raw)
+		if s == "" {
+			continue
+		}
+		if _, _, err := net.ParseCIDR(s); err == nil {
+			continue
+		}
+		if net.ParseIP(s) != nil {
+			continue
+		}
+		return fmt.Errorf("config: security.%s entry %q is not a valid CIDR or IP", name, raw)
+	}
+	return nil
+}
+
 // expandEnv replaces every ${VAR} token with os.Getenv("VAR"); unset vars
 // expand to the empty string.
 func expandEnv(s string) string {
@@ -367,6 +422,17 @@ func (c *Config) validate() error {
 		return fmt.Errorf("config: startup_checks %q must be one of off, warn, enforce", c.Security.StartupChecks)
 	}
 
+	if !sqlgate.ValidMode(c.Security.SQLGate) {
+		return fmt.Errorf("config: sql_gate %q must be one of off, on", c.Security.SQLGate)
+	}
+
+	switch c.Security.XSRF {
+	case "off", "on":
+		// supported
+	default:
+		return fmt.Errorf("config: xsrf %q must be one of off, on", c.Security.XSRF)
+	}
+
 	switch c.Security.IdentityKind {
 	case "none":
 		// The simple on-ramp: one shared connection (the top-level dsn), no RLS.
@@ -398,6 +464,20 @@ func (c *Config) validate() error {
 		}
 	default:
 		return fmt.Errorf("config: identity_kind %q must be one of none, login_role", c.Security.IdentityKind)
+	}
+
+	if err := validateIPList("allow_ips", c.Security.AllowIPs); err != nil {
+		return err
+	}
+	if err := validateIPList("deny_ips", c.Security.DenyIPs); err != nil {
+		return err
+	}
+
+	if c.Limits.MaxEstimatedCost < 0 {
+		return fmt.Errorf("config: limits.max_estimated_cost must be >= 0 (0 disables)")
+	}
+	if c.Limits.MaxEstimatedRows < 0 {
+		return fmt.Errorf("config: limits.max_estimated_rows must be >= 0 (0 disables)")
 	}
 
 	if c.TLS.Enabled {

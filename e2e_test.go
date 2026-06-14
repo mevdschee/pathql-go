@@ -516,3 +516,36 @@ func basicAuth(user, pass string) string {
 	req.SetBasicAuth(user, pass)
 	return req.Header.Get("Authorization")
 }
+
+// TestE2ECostCeiling exercises the proactive cost ceiling against a real planner:
+// a query whose EXPLAIN estimate exceeds the bound is rejected with 400 before it
+// runs, and a normal query passes once the bound is generous.
+func TestE2ECostCeiling(t *testing.T) {
+	env := setupE2E(t)
+	srv := serveE2E(t)
+	defer srv.Close()
+
+	hdr := map[string]string{"X-API-Key": e2eAPIKeyAlice}
+
+	// A tiny row ceiling rejects any non-trivial query before it runs: the planner
+	// estimates generate_series(1, 100000) at far more than one row.
+	cfg.Limits.MaxEstimatedRows = 1
+	r := post(t, srv, "SELECT g FROM generate_series(1, 100000) AS g", hdr)
+	if r.status != http.StatusBadRequest {
+		t.Fatalf("over-budget query: status = %d, body = %q, want 400", r.status, r.body)
+	}
+	if !strings.Contains(r.body, "exceeds the configured limit") {
+		t.Errorf("over-budget body = %q, want the cost-ceiling message", r.body)
+	}
+	if strings.Contains(r.body, "100000") {
+		t.Errorf("response leaked the row estimate to the client: %q", r.body)
+	}
+
+	// With a generous ceiling, a normal query runs to completion.
+	cfg.Limits.MaxEstimatedRows = 1_000_000
+	cfg.Limits.MaxEstimatedCost = 0
+	r = post(t, srv, "SELECT id FROM "+env.docsTable+" ORDER BY id", hdr)
+	if r.status != http.StatusOK {
+		t.Fatalf("within-budget query: status = %d, body = %q, want 200", r.status, r.body)
+	}
+}

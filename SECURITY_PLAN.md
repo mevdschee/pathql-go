@@ -1,24 +1,35 @@
 # Security plan
 
-This document covers authentication, the per-role connection model for row-level
-security, and the abuse/resource protections for pathql-server, plus a checklist
-of common API security best practices.
+This document covers authentication, the two identity models, the per-role
+connection model for row-level security, and the abuse/resource protections for
+pathql-server, plus a checklist of common API security best practices.
 
 ## 1. Threat model
 
-The product is "send SQL, get JSON," so the real security boundary is the
-**database role plus row-level security (RLS)**, not query parsing.
-Authentication decides _who_ the caller is; the server then connects as that
-caller's own database role so RLS policies can enforce _what_ they may see. The
-HTTP-layer limits below protect availability.
+The product is "send SQL, get JSON." There are two identity models, selected by
+`[security] identity_kind`:
+
+- **`none`** (default): a single shared database connection, no row-level
+  security. Every authenticated caller runs as the same database role, so the
+  only boundary is the role's own grants (read-only `SELECT`). This is the
+  development / single-tenant on-ramp; there is no per-caller isolation, so do
+  not use it to separate tenants.
+- **`login_role`**: the real multi-tenant boundary is the **database role plus
+  row-level security (RLS)**, not query parsing. Authentication decides _who_ the
+  caller is; the server then connects as that caller's own database role so RLS
+  policies can enforce _what_ they may see.
+
+The HTTP-layer limits below protect availability in both models.
 
 ## 2. Goals
 
 1. Authenticate every request using the common methods (API key, JWT, HTTP
-   Basic), pluggable so more can be added.
+   Basic), pluggable so more can be added. (In `none` mode authentication is
+   optional; in `login_role` mode it is required, since a principal is needed to
+   pick the role.)
 2. Resolve the caller to a user record in a configurable `pathql_auth_`-prefixed
-   table, then connect as the caller's own database role so RLS can read
-   `current_user`.
+   table. In `login_role` mode, connect as the caller's own database role so RLS
+   can read `current_user`.
 3. Add resource and abuse protections: per-query timeout, per-user concurrency
    cap, per-IP rate limit, global caps, body-size cap.
 
@@ -121,6 +132,10 @@ Resolution rules:
 
 ### 3.3 Pushing identity into the database (`current_user`)
 
+This section applies to `login_role` mode. (In the default `none` mode the
+server runs every query on one shared connection and binds no per-caller
+identity, so there is no RLS isolation; the rest of this section does not apply.)
+
 After authentication, the resolved principal must reach the SQL that runs so RLS
 can isolate rows. The server connects to PostgreSQL **as the caller's own
 database role** and lets RLS read `current_user`.
@@ -186,9 +201,17 @@ identity model targets PostgreSQL only.
   query length and parameter count.
 - **Result size:** cap rows/bytes returned, or force a `LIMIT`, to stop a single
   query from exhausting memory.
-- **Connection pool:** one pool per database role, each with `SetMaxOpenConns` /
-  `SetMaxIdleConns` / `SetConnMaxLifetime`, plus a global semaphore
-  (`max_total_backends`) capping connections across all pools.
+- **Proactive cost ceiling:** before running a query, `EXPLAIN (FORMAT JSON)` it
+  (no execution) and reject it with `400` when the planner's estimated total cost
+  or output rows exceed `limits.max_estimated_cost` / `max_estimated_rows`. This
+  stops an accidental sequential scan over a huge table or a cross join before it
+  ties up a connection, rather than relying on `statement_timeout` to kill it
+  after the work has started. PostgreSQL only; the estimate is logged, not
+  returned. 0 disables.
+- **Connection pool:** in `none` mode a single shared pool; in `login_role` mode
+  one pool per database role, each with `SetMaxOpenConns` / `SetMaxIdleConns` /
+  `SetConnMaxLifetime`, plus a global semaphore (`max_total_backends`) capping
+  connections across all pools. Pool sizing is config-only (no runtime tuning).
 
 ### 4.5 Caching layer (tqmemory / tqcache)
 
@@ -211,8 +234,10 @@ caches rather than adding a new dependency family:
   example opaque server-side sessions if a cookie/session authenticator is added
   later.
 
-Make the backend configurable (`embedded` vs a Memcached address) so the same
-code path serves both the single-instance and clustered deployments.
+The shipped implementation is the embedded in-process cache only; there is no
+configurable backend. A shared/Memcached-backed cache for clustered deployments
+remains a possible future addition, but until it exists the config exposes no
+backend toggle (one fewer knob to misconfigure).
 
 ## 5. Part C — Configuration additions
 
@@ -220,14 +245,17 @@ Extend `config.ini` (TOML supports nested tables; keep the existing flat keys):
 
 ```ini
 driver = "postgres"
+dsn    = "host=localhost port=5432 dbname=pathql sslmode=require" # shared pool, identity_kind = "none"
 listen = ":8000"
 verbose = false
 
 [security]
+identity_kind     = "none"         # "none" (shared dsn, no RLS) or "login_role"
 auth_table_prefix = "pathql_auth_"
 read_only         = true           # run queries in READ ONLY transactions
 trusted_proxies   = ["10.0.0.0/8"] # whose X-Forwarded-For we believe
 
+# [roles] is used only when identity_kind = "login_role".
 [roles]
 base_dsn        = "host=localhost port=5432 dbname=pathql sslmode=require" # no user=
 baseline_role   = "pathql_auth"    # role for pre-auth auth-table lookups
@@ -251,12 +279,10 @@ max_concurrent_per_user   = 10
 max_concurrent_global     = 200
 max_requests_per_min_ip   = 120
 max_body_bytes            = 1048576
-max_result_rows           = 10000
+max_response_bytes        = 10485760  # cap the encoded JSON response; 413 over it
 
 [cache]
-backend   = "embedded"        # "embedded" (tqmemory in-process) or "memcached"
-address   = ""                # host:port of a shared tqmemory/tqcache when clustered
-memory_mb = 64                # embedded tqmemory cap
+memory_mb = 64                # embedded in-process cache cap
 auth_ttl  = "30s"             # API-key lookup cache TTL
 jwks_ttl  = "1h"              # JWKS cache TTL
 
@@ -266,9 +292,10 @@ write_ms = 30000
 idle_ms  = 60000
 ```
 
-Secrets (`roles.base_dsn`, `roles.password_secret`, the JWT HS256 secret) should
-be loadable from environment variables, not only the file, and `config.ini`
-should be `chmod 600`.
+Secrets (`dsn`, `roles.base_dsn`, `roles.password_secret`, the JWT HS256 secret)
+should be loadable from environment variables, not only the file, and
+`config.ini` should be `chmod 600`. The `dsn` also accepts a `PATHQL_DSN`
+environment override.
 
 ## 6. Part D — Request lifecycle (middleware chain)
 
@@ -282,11 +309,14 @@ Order matters: reject cheaply before doing expensive work.
 6. Authentication -> `Principal` on the request context.
 7. Per-user concurrency limiter.
 8. Per-query timeout context.
-9. Handler: acquire the caller's per-role connection, open a READ ONLY
+9. Handler: pick the connection by identity model (`none` uses the shared pool;
+   `login_role` acquires the caller's per-role connection), open a READ ONLY
    transaction, `SET LOCAL` the `statement_timeout` (and other limits), run the
    query, COMMIT, encode JSON.
 
-Make `/metrics` bind to a separate admin listener, since it exposes query text.
+`/metrics` exposes query text, so it is served on the main listener but
+authorized only to the configured `metrics_user` principal (which is refused on
+`/pathql`); an empty `metrics_user` disables it (fail closed).
 
 ## 7. Part E — API security best-practices checklist
 
@@ -303,7 +333,15 @@ A working list of common measures to protect an API, beyond the items above:
   the app role only `SELECT`, so the "send SQL" surface cannot write or run DDL.
   Make write access an explicit, separate opt-in.
 - **Restrict dangerous SQL:** at the DB level revoke access to `COPY`,
-  `pg_read_file`, `pg_sleep`, large-object and admin functions.
+  `pg_read_file`, `pg_sleep`, large-object and admin functions. As defense in
+  depth above the DB, the optional **SQL gate** (`[security] sql_gate = "on"`,
+  `internal/sqlgate`) rejects, before execution, anything that is not a single
+  read-only statement over non-catalog objects: stacked statements,
+  non-`SELECT`/`WITH`/`TABLE`/`VALUES` statements (`SET`, `SHOW`, `EXPLAIN`,
+  `COPY`, `CALL`, `DO`, DDL/DML), and any reference to `pg_*` or
+  `information_schema` (catalog enumeration RLS does not cover). It is a string
+  setting so stricter modes (table/column allowlists, forced `LIMIT`, a
+  planner-cost ceiling) can follow.
 - **Rate limiting and throttling:** per IP, per user, and global; `429` with
   `Retry-After`.
 - **Concurrency and timeouts:** in-flight caps, HTTP read/write/idle timeouts,

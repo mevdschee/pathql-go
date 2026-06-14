@@ -1,25 +1,30 @@
-# Role and pool management plan
+# Role management plan
 
-This plans two related runtime features for pathql-server: provisioning and
-deprovisioning a PostgreSQL role per user when the user is added or removed
-through admin routes, and tuning the connection pool through admin routes. It
-builds on the login_role RLS model (identity is `current_user`, the connection
-authenticates as the user's role).
+This plans provisioning and deprovisioning a PostgreSQL role per user when the
+user is added or removed through admin routes. It applies to the `login_role`
+RLS model (identity is `current_user`, the connection authenticates as the
+user's role), which is the opt-in hardened mode selected with
+`[security] identity_kind = "login_role"`. The default `none` mode uses a single
+shared connection with no per-user roles and is not covered here.
 
-Decisions locked (this revision): build the login_role layer first; per-role
-connections authenticate with a per-role password derived from a master secret
-(`HMAC(secret, role)`, set by the sync DDL and re-derived at connect time, paired
-with scram-sha-256); the server does NOT hold CREATEROLE, it emits the exact DDL
-to sync roles which a cron job applies out of band; admin routes live on the main
-listener gated to `admin_user`.
+Connection-pool sizing is **config-only** (`[database]` and `[roles]`): there is
+no runtime pool-tuning API and no pool-settings persistence table. An earlier
+revision proposed `GET/PUT /admin/pool` and per-user overrides; those were
+dropped to keep the admin surface small, so this document no longer covers them.
+
+Decisions locked (this revision): per-role connections authenticate with a
+per-role password derived from a master secret (`HMAC(secret, role)`, set by the
+sync DDL and re-derived at connect time, paired with scram-sha-256); the server
+does NOT hold CREATEROLE, it emits the exact DDL to sync roles which a cron job
+applies out of band; admin routes live on the main listener gated to
+`admin_user`.
 
 ## 1. Goal and scope
 
-- The server creates a database role when a user is added and drops it when the
-  user is removed, both through admin routes, so login_role RLS works without a
-  human running DDL per user.
-- The server exposes pool parameters through admin routes, persisted so changes
-  survive a restart.
+- The server records a database role when a user is added and marks it for
+  removal when the user is removed, both through admin routes, and emits the DDL
+  that makes login_role RLS work without a human composing it per user.
+- Pool parameters are set in config (`[database]`, `[roles]`), not at runtime.
 - Out of scope: the static setup (protected tables, RLS policies, the shared
   reader role) stays a deploy-time concern handled by the sibling rls-polyfill.
   This document covers only the dynamic, per-user lifecycle at runtime.
@@ -77,19 +82,10 @@ This is the `internal/roles` package (built first, in the background).
 
 ## 5. Persistence
 
-Runtime state lives in the database so it survives a restart; config.ini seeds
-the initial values.
-
-- `pathql_pool_settings`: a single row holding the global pool defaults
-  (`max_open_conns`, `max_idle_conns`, `conn_max_lifetime_ms`,
-  `conn_max_idle_time_ms`). Created from the config.ini values on first boot if
-  absent; authoritative at runtime.
-- `pathql_auth_users` gains `db_role` (the managed role name) and, if per-user
-  overrides are kept (open decision), nullable
-  `pool_max_open` / `pool_max_idle` / `pool_conn_max_lifetime_ms` /
-  `pool_conn_max_idle_time_ms`, where null means inherit the global default.
-- Bootstrap reads `pathql_pool_settings` over a connection opened from the
-  config.ini defaults, then applies it.
+The only persisted state is on the user row: `pathql_auth_users` gains `db_role`
+(the managed role name), so removal is unambiguous and never reconstructed from
+user input. Pool parameters are not persisted; they come from config.ini on
+every boot. There is no `pathql_pool_settings` table.
 
 ## 6. Admin routes
 
@@ -99,17 +95,17 @@ resolved admin identity, and the existing rate limits. TLS is expected.
 
 User lifecycle:
 
-- `POST /admin/users` create a user, provision its role.
-- `DELETE /admin/users/{id}` remove a user, deprovision its role.
+- `POST /admin/users` create a user, record its pending role.
+- `DELETE /admin/users/{id}` remove a user, evict its pool, mark its role for the
+  next sync to drop.
 
-Pool configuration:
+Role sync:
 
-- `GET /admin/pool` effective global params, any per-user overrides, and live
-  `db.Stats()` per pool and aggregate (open, in use, idle, wait count, wait
-  duration).
-- `PUT /admin/pool` set the global defaults.
-- `PUT /admin/users/{id}/pool` and `DELETE /admin/users/{id}/pool` set or clear a
-  per-user override (only if overrides are kept).
+- `GET /admin/roles/sync` emit the DDL that reconciles the database roles with
+  the users table, for an operator or cron job to apply.
+
+There are no pool-configuration routes: pool sizing is config-only (see the note
+at the top of this document).
 
 ## 7. Role lifecycle operations
 
@@ -149,7 +145,7 @@ Read-only managed roles own no objects, so `DROP OWNED BY` only clears grants;
 ## 8. Connection pool manager
 
 - A map of role to pool, each created lazily on first request for that role with
-  the current effective parameters.
+  the configured pool parameters from `[database]`.
 - A global weighted semaphore sized at `max_total_backends`. Every checkout
   acquires from it before using a connection. PostgreSQL has no cross-pool limit
   and `database/sql` has no global cap, so this semaphore is what bounds the total
@@ -158,21 +154,16 @@ Read-only managed roles own no objects, so `DROP OWNED BY` only clears grants;
 - `warm_pool_limit` caps how many role pools keep a warm idle connection; an LRU
   evicts idle connections from pools beyond the limit. The pool struct can remain
   with zero open connections.
-- A re-apply operation pushes changed parameters onto live pools via
-  `SetMaxOpenConns` / `SetMaxIdleConns` / `SetConnMaxLifetime` /
-  `SetConnMaxIdleTime`, all of which take effect without a restart.
-- Per-pool `db.Stats()` is exposed to `GET /admin/pool`.
 
-## 9. Runtime pool parameters
+## 9. Pool parameters
 
-- API mutable and persisted: the global defaults, and the per-user overrides if
-  kept. Writes update the table and re-apply to live pools.
-- Config only, never exposed by the API: `max_total_backends` and
-  `warm_pool_limit`. These are the guardrails the API must not be able to raise.
-- Validation: `max_open >= 1` (no unlimited, which would let one pool exhaust the
-  database), `max_idle <= max_open`, any per-pool `max_open` clamped to
-  `max_total_backends`, sane duration ranges. The semaphore is the backstop if
-  validation is ever bypassed.
+- All from config, fixed for the process lifetime: the per-pool defaults
+  (`max_open_conns`, `max_idle_conns`, `conn_max_lifetime_ms`,
+  `conn_max_idle_time_ms`) under `[database]`, plus the `max_total_backends` and
+  `warm_pool_limit` guardrails. There is no runtime mutation and no per-user
+  override.
+- The global semaphore at `max_total_backends` is the hard backstop on total
+  backends regardless of the per-pool values.
 
 ## 10. Reconciliation
 
@@ -192,21 +183,24 @@ check:
 conn_max_idle_time_ms = 60000
 max_total_backends    = 200   # hard ceiling, config only
 
+[security]
+identity_kind = "login_role"  # select the per-role model (default is "none")
+admin_user    = "admin"       # principal allowed on /admin/*; empty disables them
+
 [roles]
-manage          = true
+base_dsn        = "host=... dbname=pathql sslmode=disable"  # no user=
+baseline_role   = "pathql_auth"
 prefix          = "pathql_r_"
 reader_role     = "pathql_readers"
 warm_pool_limit = 64          # config only
-provisioner_dsn = "host=... user=pathql_provisioner password=${...} ..."
-
-[security]
-admin_user = "admin"          # principal allowed on /admin/*; empty disables them
+password_secret = "${PATHQL_ROLE_SECRET}"  # derives each role's connection password
 ```
 
 ## 12. Security rails
 
-- CREATEROLE only on the isolated provisioner connection; never the query or
-  reader roles; not a superuser.
+- The server holds no CREATEROLE: it only reads the catalog to emit the sync
+  DDL, which a privileged out-of-band role (operator or cron) applies. The query
+  and reader roles are never CREATEROLE and never superuser.
 - Managed roles are `LOGIN NOSUPERUSER NOCREATEROLE`, members only of the reader
   role, never of each other (the pivot risk).
 - LOGIN roles are only safe because `pg_hba` restricts who may connect as them
@@ -224,10 +218,8 @@ admin_user = "admin"          # principal allowed on /admin/*; empty disables th
 - Against a throwaway PostgreSQL: provision a user, the role exists with reader
   membership, connects, and is RLS isolated; remove the user, the role is gone and
   the pool evicted with no orphan; the prefix guard refuses to drop an unmanaged
-  role; a live `PUT /admin/pool` changes pool behavior; the global ceiling holds
-  even with absurd per-pool values; per-user override precedence; settings persist
-  across a restart; reconcile creates a missing role and reports an orphan without
-  dropping it.
+  role; the global ceiling holds even with absurd per-pool values; reconcile
+  creates a missing role and reports an orphan without dropping it.
 
 ## 14. Build order
 
@@ -237,10 +229,9 @@ admin_user = "admin"          # principal allowed on /admin/*; empty disables th
 2. Role lifecycle SQL behind a small `roles` package, tested against throwaway
    PostgreSQL.
 3. Admin routes and `admin_user` gating, audit and rate limiting.
-4. Pool manager: global semaphore, warm-pool LRU, live re-apply, per-pool stats.
-5. Runtime pool parameters: persistence tables, the pool routes, validation.
-6. Reconcile, report-only, wired into startup.
-7. Docs (README operations, config, hardening notes) and demo wiring.
+4. Pool manager: global semaphore, warm-pool LRU, per-pool stats (read-only).
+5. Reconcile, report-only, wired into startup.
+6. Docs (README operations, config, hardening notes) and demo wiring.
 
 ## 15. Open decisions
 
@@ -252,5 +243,7 @@ admin_user = "admin"          # principal allowed on /admin/*; empty disables th
    route).
 3. Admin route exposure: gate on `admin_user` on the main listener, or bind
    `/admin/*` to a separate or loopback listener for network isolation.
-4. Per-user pool overrides: include them now, or ship global-only first and add
-   overrides later.
+
+Resolved since the first revision: pool parameters are config-only (no runtime
+`/admin/pool` routes and no per-user overrides), and the server emits role-sync
+DDL rather than holding a CREATEROLE provisioner credential.

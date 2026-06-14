@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -37,6 +38,10 @@ type recorder struct {
 	// failErr, when set, is returned by every Exec so a test can force a
 	// session-setting failure and exercise the rollback path.
 	failErr error
+	// explainJSON, when set, is returned as the single column of a single row for
+	// any query beginning with "EXPLAIN", so the cost-ceiling path can be exercised
+	// without a real planner.
+	explainJSON []byte
 }
 
 func (r *recorder) record(query string, args []driver.Value) {
@@ -118,17 +123,38 @@ func (s recStmt) Exec(args []driver.Value) (driver.Result, error) {
 
 func (s recStmt) Query(args []driver.Value) (driver.Rows, error) {
 	s.rec.record(s.query, args)
+	s.rec.mu.Lock()
+	ej := s.rec.explainJSON
+	s.rec.mu.Unlock()
+	if ej != nil && strings.HasPrefix(strings.ToUpper(strings.TrimSpace(s.query)), "EXPLAIN") {
+		return &recRows{cols: []string{"QUERY PLAN"}, rows: [][]driver.Value{{ej}}}, nil
+	}
 	return &recRows{}, nil
 }
 
-// recRows is an empty result set with a single column so set_config queries
-// (run via Query, since they SELECT) have somewhere to scan from.
-type recRows struct{ done bool }
+// recRows is a result set the fake serves. With no cols it presents a single
+// "set_config" column and no rows (the default, for the SELECT set_config calls);
+// EXPLAIN queries get a one-row "QUERY PLAN" set carrying the recorder's plan JSON.
+type recRows struct {
+	cols []string
+	rows [][]driver.Value
+	pos  int
+}
 
-func (r *recRows) Columns() []string { return []string{"set_config"} }
-func (r *recRows) Close() error      { return nil }
+func (r *recRows) Columns() []string {
+	if r.cols == nil {
+		return []string{"set_config"}
+	}
+	return r.cols
+}
+func (r *recRows) Close() error { return nil }
 func (r *recRows) Next(dest []driver.Value) error {
-	return io.EOF
+	if r.pos >= len(r.rows) {
+		return io.EOF
+	}
+	copy(dest, r.rows[r.pos])
+	r.pos++
+	return nil
 }
 
 type recDriver struct{ rec *recorder }
@@ -153,6 +179,7 @@ func openRecordingTx(t *testing.T, readOnly bool) (*sqlx.Tx, *recorder, func()) 
 	sharedRecorder.commits = 0
 	sharedRecorder.rollbacks = 0
 	sharedRecorder.failErr = nil
+	sharedRecorder.explainJSON = nil
 	sharedRecorder.mu.Unlock()
 
 	sdb, err := sql.Open(recDriverName, "")
@@ -332,4 +359,137 @@ func TestRunQuery_LivePostgres(t *testing.T) {
 		t.Fatalf("RunQuery: %v", err)
 	}
 	t.Logf("live result: %#v", res)
+}
+
+// --- proactive cost ceiling ------------------------------------------------
+
+func TestParsePlanEstimate(t *testing.T) {
+	t.Run("valid", func(t *testing.T) {
+		raw := []byte(`[{"Plan":{"Node Type":"Seq Scan","Total Cost":1234.56,"Plan Rows":9000}}]`)
+		est, err := parsePlanEstimate(raw)
+		if err != nil {
+			t.Fatalf("parsePlanEstimate: %v", err)
+		}
+		if est.Cost != 1234.56 {
+			t.Errorf("Cost = %v, want 1234.56", est.Cost)
+		}
+		if est.Rows != 9000 {
+			t.Errorf("Rows = %v, want 9000", est.Rows)
+		}
+	})
+	t.Run("malformed", func(t *testing.T) {
+		if _, err := parsePlanEstimate([]byte("not json")); err == nil {
+			t.Error("expected error for malformed JSON")
+		}
+	})
+	t.Run("empty array", func(t *testing.T) {
+		if _, err := parsePlanEstimate([]byte("[]")); err == nil {
+			t.Error("expected error for empty plan array")
+		}
+	})
+}
+
+func TestCostCeilingError(t *testing.T) {
+	est := planEstimate{Cost: 5000, Rows: 9000}
+	cases := []struct {
+		name     string
+		maxCost  float64
+		maxRows  int64
+		wantOver bool
+	}{
+		{"both disabled", 0, 0, false},
+		{"within both", 6000, 10000, false},
+		{"over cost", 1000, 0, true},
+		{"over rows", 0, 1000, true},
+		{"cost ok rows over", 6000, 1000, true},
+		{"exactly at cost is allowed", 5000, 0, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := costCeilingError(est, tc.maxCost, tc.maxRows)
+			if tc.wantOver {
+				if !errors.Is(err, ErrQueryTooExpensive) {
+					t.Errorf("err = %v, want ErrQueryTooExpensive", err)
+				}
+			} else if err != nil {
+				t.Errorf("err = %v, want nil", err)
+			}
+		})
+	}
+}
+
+func TestEnforceCostCeiling_DisabledIssuesNoExplain(t *testing.T) {
+	tx, rec, cleanup := openRecordingTx(t, true)
+	defer cleanup()
+
+	if err := enforceCostCeiling(context.Background(), tx, "SELECT 1", nil, 0, 0); err != nil {
+		t.Fatalf("enforceCostCeiling: %v", err)
+	}
+	if got := rec.snapshot(); len(got) != 0 {
+		t.Errorf("expected no EXPLAIN to be issued when disabled, got %+v", got)
+	}
+}
+
+func TestEnforceCostCeiling_RejectsOverBudget(t *testing.T) {
+	tx, rec, cleanup := openRecordingTx(t, true)
+	defer cleanup()
+	rec.mu.Lock()
+	rec.explainJSON = []byte(`[{"Plan":{"Total Cost":5000.0,"Plan Rows":10}}]`)
+	rec.mu.Unlock()
+
+	// Cost over the bound.
+	if err := enforceCostCeiling(context.Background(), tx, "SELECT 1", nil, 1000, 0); !errors.Is(err, ErrQueryTooExpensive) {
+		t.Fatalf("over cost: err = %v, want ErrQueryTooExpensive", err)
+	}
+	// Within the bound: passes.
+	if err := enforceCostCeiling(context.Background(), tx, "SELECT 1", nil, 1_000_000, 0); err != nil {
+		t.Fatalf("within budget: err = %v, want nil", err)
+	}
+	// The EXPLAIN that was issued carried the FORMAT JSON prefix.
+	var sawExplain bool
+	for _, s := range rec.snapshot() {
+		if strings.HasPrefix(s.query, "EXPLAIN (FORMAT JSON) ") {
+			sawExplain = true
+		}
+	}
+	if !sawExplain {
+		t.Error("expected an EXPLAIN (FORMAT JSON) statement to be issued")
+	}
+}
+
+func TestRunQuery_RejectsOverBudgetBeforeExecuting(t *testing.T) {
+	sharedRecorder.mu.Lock()
+	sharedRecorder.stmts = nil
+	sharedRecorder.begins = 0
+	sharedRecorder.commits = 0
+	sharedRecorder.rollbacks = 0
+	sharedRecorder.failErr = nil
+	sharedRecorder.explainJSON = []byte(`[{"Plan":{"Total Cost":9999.0,"Plan Rows":1000000}}]`)
+	sharedRecorder.mu.Unlock()
+	t.Cleanup(func() {
+		sharedRecorder.mu.Lock()
+		sharedRecorder.explainJSON = nil
+		sharedRecorder.mu.Unlock()
+	})
+
+	sdb, err := sql.Open(recDriverName, "")
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	pool := pathsqlx.NewDb(sdb, recDriverName)
+	t.Cleanup(func() { _ = pool.DB.DB.Close() })
+
+	opts := QueryOptions{MaxEstimatedRows: 100}
+	_, err = RunQuery(context.Background(), pool, "SELECT 1", nil, nil, opts)
+	if !errors.Is(err, ErrQueryTooExpensive) {
+		t.Fatalf("err = %v, want ErrQueryTooExpensive", err)
+	}
+	sharedRecorder.mu.Lock()
+	defer sharedRecorder.mu.Unlock()
+	if sharedRecorder.commits != 0 {
+		t.Errorf("commits = %d, want 0 (a rejected query must not run or commit)", sharedRecorder.commits)
+	}
+	if sharedRecorder.rollbacks != 1 {
+		t.Errorf("rollbacks = %d, want 1", sharedRecorder.rollbacks)
+	}
 }

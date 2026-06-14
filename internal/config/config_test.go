@@ -389,6 +389,17 @@ auth_table_prefix = "x\"; DROP TABLE"
 `,
 			wantMsg: "auth_table_prefix",
 		},
+		{
+			name: "unknown sql_gate mode",
+			content: `
+driver = "postgres"
+dsn    = "host=localhost dbname=pathql"
+
+[security]
+sql_gate = "strict"
+`,
+			wantMsg: "sql_gate",
+		},
 	}
 
 	for _, tc := range tests {
@@ -597,6 +608,7 @@ func TestLoad_NewDefaults(t *testing.T) {
 		{"Limits.MaxAuthFailuresPerMin", cfg.Limits.MaxAuthFailuresPerMin, 60},
 		{"Security.MetricsUser", cfg.Security.MetricsUser, "metrics"},
 		{"Security.StartupChecks", cfg.Security.StartupChecks, "warn"},
+		{"Security.SQLGate", cfg.Security.SQLGate, "off"},
 		{"Database.ConnMaxIdleTimeMs", cfg.Database.ConnMaxIdleTimeMs, 60000},
 		{"Database.MaxTotalBackends", cfg.Database.MaxTotalBackends, 200},
 		{"Roles.BaselineRole", cfg.Roles.BaselineRole, "pathql_auth"},
@@ -843,5 +855,35 @@ func TestWeakRoleSecretFinding(t *testing.T) {
 				t.Errorf("finding = %q, want empty when not weak", finding)
 			}
 		})
+	}
+}
+
+func TestLoad_CostCeilingLimits(t *testing.T) {
+	// Default is disabled (0).
+	cfg, err := Load(writeTemp(t, minimalValid))
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.Limits.MaxEstimatedCost != 0 || cfg.Limits.MaxEstimatedRows != 0 {
+		t.Errorf("defaults = (%v, %v), want (0, 0)", cfg.Limits.MaxEstimatedCost, cfg.Limits.MaxEstimatedRows)
+	}
+
+	// Explicit values decode.
+	cfg, err = Load(writeTemp(t, minimalValid+"\n[limits]\nmax_estimated_cost = 50000.5\nmax_estimated_rows = 100000\n"))
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	if cfg.Limits.MaxEstimatedCost != 50000.5 {
+		t.Errorf("MaxEstimatedCost = %v, want 50000.5", cfg.Limits.MaxEstimatedCost)
+	}
+	if cfg.Limits.MaxEstimatedRows != 100000 {
+		t.Errorf("MaxEstimatedRows = %v, want 100000", cfg.Limits.MaxEstimatedRows)
+	}
+
+	// Negative values are rejected.
+	for _, bad := range []string{"max_estimated_cost = -1", "max_estimated_rows = -1"} {
+		if _, err := Load(writeTemp(t, minimalValid+"\n[limits]\n"+bad+"\n")); err == nil {
+			t.Errorf("Load(%q) returned nil error, want rejection", bad)
+		}
 	}
 }

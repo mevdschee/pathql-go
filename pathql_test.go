@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -128,6 +129,36 @@ func TestPathQlEndpointArrayParams(t *testing.T) {
 	}
 	if !strings.Contains(rw.Body.String(), "params must be an object") {
 		t.Errorf("unexpected body: %q", rw.Body.String())
+	}
+}
+
+// TestPathQlEndpointSQLGate verifies the optional SQL gate rejects a
+// system-catalog query with a clean 400 before any database work, and that with
+// the gate off the same query is not rejected by the gate.
+func TestPathQlEndpointSQLGate(t *testing.T) {
+	setTestConfig(t)
+	const body = `{"query":"SELECT * FROM pg_catalog.pg_authid"}`
+
+	// Gate on: rejected at the edge. No principal or pool is needed because the
+	// gate runs before identity resolution and any database access.
+	cfg.Security.SQLGate = "on"
+	rw := httptest.NewRecorder()
+	PathQlEndpoint(rw, httptest.NewRequest(http.MethodPost, "/pathql", strings.NewReader(body)))
+	if rw.Code != http.StatusBadRequest {
+		t.Fatalf("gate on: expected 400, got %d (body %q)", rw.Code, rw.Body.String())
+	}
+	if !strings.Contains(rw.Body.String(), "system catalogs") {
+		t.Errorf("gate on: unexpected body: %q", rw.Body.String())
+	}
+
+	// Gate off: the gate does not reject. With login_role and no principal the
+	// request then fails identity resolution (401), proving the 400 above came
+	// from the gate and that the gate stays out of the way when off.
+	cfg.Security.SQLGate = "off"
+	rw = httptest.NewRecorder()
+	PathQlEndpoint(rw, httptest.NewRequest(http.MethodPost, "/pathql", strings.NewReader(body)))
+	if rw.Code == http.StatusBadRequest {
+		t.Errorf("gate off: query was rejected (400 %q), want it to pass the gate", rw.Body.String())
 	}
 }
 
@@ -325,5 +356,102 @@ func TestPublicChainRequiresJSONContentType(t *testing.T) {
 	h.ServeHTTP(rw, req)
 	if rw.Code != http.StatusUnsupportedMediaType {
 		t.Fatalf("expected 415, got %d (body %q)", rw.Code, rw.Body.String())
+	}
+}
+
+// --- cost-ceiling handler integration -------------------------------------
+//
+// costPlanDriver is a minimal fake whose EXPLAIN returns a fixed, deliberately
+// over-budget plan. It lets the cost-ceiling rejection be exercised through the
+// real handler without a live planner.
+type costPlanConn struct{}
+
+func (costPlanConn) Prepare(q string) (driver.Stmt, error) { return costPlanStmt{q: q}, nil }
+func (costPlanConn) Close() error                          { return nil }
+func (costPlanConn) Begin() (driver.Tx, error)             { return costPlanTx{}, nil }
+func (costPlanConn) BeginTx(context.Context, driver.TxOptions) (driver.Tx, error) {
+	return costPlanTx{}, nil
+}
+
+type costPlanTx struct{}
+
+func (costPlanTx) Commit() error   { return nil }
+func (costPlanTx) Rollback() error { return nil }
+
+type costPlanStmt struct{ q string }
+
+func (costPlanStmt) Close() error                               { return nil }
+func (costPlanStmt) NumInput() int                              { return -1 }
+func (costPlanStmt) Exec([]driver.Value) (driver.Result, error) { return driver.RowsAffected(0), nil }
+func (s costPlanStmt) Query([]driver.Value) (driver.Rows, error) {
+	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(s.q)), "EXPLAIN") {
+		return &costPlanRows{plan: []byte(`[{"Plan":{"Total Cost":1.0,"Plan Rows":1000000}}]`)}, nil
+	}
+	return &costPlanRows{}, nil
+}
+
+type costPlanRows struct {
+	plan []byte
+	done bool
+}
+
+func (r *costPlanRows) Columns() []string {
+	if r.plan == nil {
+		return []string{"x"}
+	}
+	return []string{"QUERY PLAN"}
+}
+func (r *costPlanRows) Close() error { return nil }
+func (r *costPlanRows) Next(dest []driver.Value) error {
+	if r.plan == nil || r.done {
+		return io.EOF
+	}
+	dest[0] = r.plan
+	r.done = true
+	return nil
+}
+
+type costPlanDriver struct{}
+
+func (costPlanDriver) Open(string) (driver.Conn, error) { return costPlanConn{}, nil }
+
+const costPlanDriverName = "pathqltestcostplan"
+
+func init() { sql.Register(costPlanDriverName, costPlanDriver{}) }
+
+// TestPathQlEndpointCostCeilingRejects verifies that when the planner estimate
+// exceeds the configured bound, the handler returns 400 with a generic message
+// that does not leak the estimate or the limit.
+func TestPathQlEndpointCostCeilingRejects(t *testing.T) {
+	setTestConfig(t)
+	cfg.Security.IdentityKind = "none" // shared pool, no principal needed
+	cfg.Driver = "postgres"            // enables the EXPLAIN cost check
+	cfg.Limits.MaxEstimatedRows = 100
+
+	p, err := pathsqlx.Open(costPlanDriverName, "")
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	old := pool
+	pool = p
+	t.Cleanup(func() {
+		_ = p.DB.DB.Close()
+		pool = old
+	})
+
+	rw := httptest.NewRecorder()
+	PathQlEndpoint(rw, httptest.NewRequest(http.MethodPost, "/pathql",
+		strings.NewReader(`{"query":"SELECT 1"}`)))
+
+	if rw.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d (body %q)", rw.Code, rw.Body.String())
+	}
+	body := rw.Body.String()
+	if !strings.Contains(body, "exceeds the configured limit") {
+		t.Errorf("unexpected body: %q", body)
+	}
+	// The estimate and the limit must stay in the logs, not the client body.
+	if strings.Contains(body, "1000000") || strings.Contains(body, "estimated rows") {
+		t.Errorf("response leaked cost-estimate detail: %q", body)
 	}
 }

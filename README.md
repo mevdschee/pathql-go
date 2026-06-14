@@ -104,8 +104,12 @@ auth_table_prefix           = "pathql_auth_"
 read_only                   = true
 metrics_user                = "metrics"
 startup_checks              = "warn"
+sql_gate                    = "off"    # "off" or "on" (see SQL gate)
+xsrf                        = "off"    # "off" or "on" (see XSRF / CSRF protection)
 # admin_user                = "admin"
 # trusted_proxies = ["10.0.0.0/8", "192.168.0.0/16"]
+# allow_ips = ["10.0.0.0/8"]           # IP firewall allowlist (see IP firewall)
+# deny_ips  = ["203.0.113.7"]          # IP firewall denylist
 
 [auth]
 methods        = ["apikey", "basic"]
@@ -129,6 +133,8 @@ max_concurrent_global     = 200
 max_requests_per_min_ip   = 120
 max_auth_failures_per_min = 60
 work_mem_kb               = 0
+max_estimated_cost        = 0          # EXPLAIN cost ceiling; 0 disables (Postgres only)
+max_estimated_rows        = 0          # EXPLAIN estimated-rows ceiling; 0 disables
 
 [timeouts]
 read_ms  = 10000
@@ -175,9 +181,12 @@ Section options:
   auth tables. `metrics_user` is the principal allowed to read `/metrics` (see
   [Metrics](#metrics)). `admin_user` gates the [admin routes](#admin-routes).
   `startup_checks` controls the [startup hardening check](#startup-hardening-checks).
+  `sql_gate` enables the optional pre-execution [SQL gate](#sql-gate).
+  `xsrf` enables the optional [XSRF / CSRF protection](#xsrf--csrf-protection).
   `trusted_proxies` is a list of CIDRs (or bare IPs) whose `RemoteAddr` is
-  trusted to set `X-Forwarded-For` / `X-Real-IP`; the rate limiter uses it to
-  find the real client IP.
+  trusted to set `X-Forwarded-For` / `X-Real-IP`; the rate limiter (and the IP
+  firewall) use it to find the real client IP. `allow_ips` and `deny_ips` are the
+  optional [IP firewall](#ip-firewall) lists.
 - **`[auth]`**: see [Authentication](#authentication).
 - **`[roles]`**: the per-role connection model, used only when
   `identity_kind = "login_role"`, see [Row-level security](#row-level-security).
@@ -193,6 +202,8 @@ Section options:
   `max_requests_per_min_ip` and `max_auth_failures_per_min` are the
   abuse-protection caps, see
   [Rate limiting and concurrency](#rate-limiting-and-concurrency).
+  `max_estimated_cost` and `max_estimated_rows` are the proactive
+  [cost ceiling](#cost-ceiling).
 - **`[timeouts]`**: HTTP server `read_ms`, `write_ms`, and `idle_ms`.
 - **`[cache]`**: the in-process counter/JWKS cache, see [Cache](#cache).
 - **`[tls]`**: optional TLS termination, see [TLS](#tls).
@@ -409,6 +420,49 @@ cross-origin requests. A matching `Origin` is echoed back in
 wildcard `*` is never emitted, so the response is always safe to combine with
 credentials. An empty list disables cross-origin access.
 
+## IP firewall
+
+An optional allow/deny IP firewall gates **every** route (`/pathql`, `/schema`,
+`/health`, `/metrics`, `/admin/*`) by the resolved client IP, before
+authentication. It is configured under `[security]`:
+
+- **`deny_ips`**: a list of CIDRs (or bare IPs). A request from any address in
+  the list is rejected with `403`.
+- **`allow_ips`**: a list of CIDRs (or bare IPs). When non-empty, only addresses
+  in the list are admitted and everything else gets `403` (default-deny). An
+  empty list admits all addresses (still subject to `deny_ips`).
+
+`deny_ips` is evaluated first, so an address in both lists is denied. Leaving both
+empty disables the firewall. The client IP is resolved with the same
+`trusted_proxies` rules the rate limiter uses, so an untrusted peer cannot lift
+itself onto the allowlist with a spoofed `X-Forwarded-For`; set `trusted_proxies`
+accurately when running behind a reverse proxy or load balancer. The firewall is
+a coarse network gate, not a substitute for authentication.
+
+## XSRF / CSRF protection
+
+`[security] xsrf` enables double-submit-cookie CSRF protection (`"off"` by
+default). It is defense in depth for browser deployments that authenticate with
+cookies or HTTP Basic; an API driven only with `X-API-Key` or
+`Authorization: Bearer` headers does not strictly need it, and the
+`application/json` body requirement plus the locked-down [CORS](#cors) policy
+already make `/pathql` hard to drive from a cross-site form.
+
+When `xsrf = "on"`:
+
+- A safe request (`GET`/`HEAD`/`OPTIONS`) that arrives without an `XSRF-TOKEN`
+  cookie is given a fresh one. The cookie is `SameSite=Strict` and (over TLS)
+  `Secure`, and is deliberately readable by JavaScript so a first-party client
+  can echo it back.
+- A state-changing request (`POST`/`PUT`/`PATCH`/`DELETE`) must send an
+  `X-XSRF-TOKEN` header equal to the `XSRF-TOKEN` cookie, or it is rejected with
+  `403`. Because the same-origin policy stops a cross-site page from reading the
+  cookie, only first-party code can produce a matching header.
+
+The intended flow is: make one safe request to obtain the cookie, then include
+its value in the `X-XSRF-TOKEN` header on every later unsafe request. The check
+applies to `/pathql` and the `/admin/*` routes.
+
 ## Operations / hardening
 
 - Run the application as a least-privilege, `SELECT`-only database role and rely
@@ -432,13 +486,14 @@ go build -o pathql-server
 ./pathql-server
 ```
 
-The server listens on `listen` (default `:8000`) and serves both
-`POST /pathql` (execute queries) and `GET /metrics` (request metrics). Because
-`top_queries` exposes raw query text, `/metrics` is authorized only for the
-configured `metrics_user` principal, who may read metrics and nothing else, see
-[Metrics](#metrics). At startup the server also runs a database hardening
-self-check, see [Startup hardening checks](#startup-hardening-checks). It shuts
-down gracefully on SIGINT/SIGTERM.
+The server listens on `listen` (default `:8000`) and serves `POST /pathql`
+(execute queries), `GET /schema` ([reflect the schema as DBML](#schema-reflection)),
+`GET /health` ([readiness probe](#health-check)) and `GET /metrics` (request
+metrics). Because `top_queries` exposes raw query text, `/metrics` is authorized
+only for the configured `metrics_user` principal, who may read metrics and
+nothing else, see [Metrics](#metrics). At startup the server also runs a database
+hardening self-check, see [Startup hardening checks](#startup-hardening-checks).
+It shuts down gracefully on SIGINT/SIGTERM.
 
 ## Startup hardening checks
 
@@ -448,17 +503,81 @@ off-server. With `startup_checks` set, the server verifies the connected role's
 actual posture once at startup using read-only catalog queries, and reports what
 it finds:
 
-- **Critical**: the role is a superuser (it bypasses RLS and read-only), or it
-  can write (`INSERT`/`UPDATE`/`DELETE`) to tables outside the auth tables.
+- **Critical**: the role is a superuser or has the `BYPASSRLS` attribute (either
+  bypasses RLS and read-only), or it can write
+  (`INSERT`/`UPDATE`/`DELETE`) to tables outside the auth tables. In `enforce`
+  mode under `login_role`, a readable table with **no** row-level security is
+  also critical, since it is a silent full-table exposure where RLS is the
+  boundary.
 - **Warning**: the role can execute sensitive functions (`pg_read_file`,
-  `pg_sleep`, large-object functions, ...), or it can read tables that have no
-  row-level security (so every authenticated caller sees all their rows).
+  `pg_sleep`, large-object functions, ...); it can read tables that have no
+  row-level security (so every authenticated caller sees all their rows); it
+  **owns** a table whose RLS is enabled but **not forced** (a table owner
+  bypasses its own non-forced policies, so apply `FORCE ROW LEVEL SECURITY`); or
+  a table has RLS enabled but **no policy** (a safe default-deny, reported so an
+  intentional lockdown is not mistaken for a missing one).
 
 `startup_checks = "warn"` (the default) logs the findings and keeps running;
 `"enforce"` additionally refuses to start when there is a critical finding;
 `"off"` skips the check. The checks are PostgreSQL-only and are skipped for other
 drivers. See [examples/rls_policy.sql](examples/rls_policy.sql) for the grants
 and revokes that make them pass.
+
+## SQL gate
+
+The SQL gate is an optional, pre-execution validator that narrows the
+"send SQL, get JSON" surface before a query reaches the database. The database
+remains the real boundary (a least-privilege role, the read-only transaction,
+and RLS); the gate is defense in depth that rejects classes of query those
+controls do not fully cover. It is set with `[security] sql_gate` and is `"off"`
+by default.
+
+When `sql_gate = "on"`, a query is rejected with `400` (and a clean,
+shape-describing message) unless it is:
+
+- **a single statement** - stacked statements (`SELECT ...; DROP ...`) are
+  rejected even where a driver would run them;
+- **read-only** - it must begin with `SELECT`, `WITH`, `TABLE` or `VALUES`, so
+  `SET`, `SHOW`, `EXPLAIN`, `COPY`, `CALL`, `DO` and any DDL/DML are refused at
+  the edge (several of these run even inside a `READ ONLY` transaction); and
+- **free of system catalogs** - no identifier may name `information_schema` or
+  start with the reserved `pg_` prefix, closing off catalog enumeration
+  (`pg_class`, `pg_authid`, `pg_stat_activity`, ...) that row-level security does
+  not protect.
+
+The check is content-aware: a `;`, a `pg_` name, or a keyword that appears
+inside a string literal, a quoted identifier, a comment, or a dollar-quoted body
+does not trigger a rejection. The value is a string so stricter modes (table or
+column allowlists, a forced `LIMIT`) can be added later without breaking
+existing configs.
+
+## Cost ceiling
+
+The cost ceiling rejects a query *before running it* when the PostgreSQL planner
+estimates it would be too expensive. With `[limits] max_estimated_cost` or
+`max_estimated_rows` set above `0`, the server runs `EXPLAIN (FORMAT JSON)` on
+the query first (inside the same read-only transaction, with the same bound
+parameters, and bounded by the same `statement_timeout`). Plain `EXPLAIN` only
+asks the planner for an estimate; it never executes the query, so the check has
+no side effects. If the top node's estimated total cost exceeds
+`max_estimated_cost`, or its estimated output rows exceed `max_estimated_rows`,
+the request is rejected with `400` and a generic message; the actual estimate
+and the limit are logged server-side, not returned, so data volume is not
+disclosed.
+
+Both bounds default to `0` (disabled). `max_estimated_cost` is in PostgreSQL
+planner cost units (the same units `EXPLAIN` prints), so pick a value by running
+`EXPLAIN` on representative and pathological queries. The check is PostgreSQL
+only; it is skipped for other drivers. It is one EXPLAIN round-trip per request,
+so enable it when you accept queries from untrusted callers and want to stop a
+sequential scan over a huge table or an accidental cross join before it ties up a
+connection.
+
+Enable the [SQL gate](#sql-gate) alongside the cost ceiling. The gate restricts
+each request to a single read-only statement, so the EXPLAIN the ceiling runs
+plans exactly that one statement; without it a stacked statement could be planned
+or run during the EXPLAIN step (the read-only transaction still blocks writes,
+but the gate is the cleaner boundary).
 
 ## Testing
 
@@ -579,6 +698,47 @@ them, with the request count and accumulated duration for each. It uses the same
 bounded Space-Saving counter (up to 1000 distinct identities), and only
 authenticated requests are attributed (the metrics principal is excluded, since
 it is refused on `/pathql`).
+
+## Health check
+
+`GET /health` is an unauthenticated readiness probe for load balancers and
+orchestrators. It returns `200` with `{"status":"ok","database":"up"}` when the
+database answered a recent ping, and `503` with
+`{"status":"unavailable","database":"down"}` when it did not, so an orchestrator
+keeps traffic away until the database is reachable. The reachability result is
+cached for about a second, so frequent probes (or a flood of requests) cannot
+turn the endpoint into a database-load amplifier. It is intentionally exempt from
+authentication, rate limiting and the concurrency caps so a probe always gets a
+prompt answer; the [IP firewall](#ip-firewall), if configured, still applies.
+
+## Schema reflection
+
+`GET /schema` returns the tables, columns, primary keys and foreign keys the
+caller can read, rendered as [DBML](https://dbml.dbdiagram.io/) by the bundled
+dbml-tools introspection, so a client can discover what to query (table names,
+columns, and the foreign-key relationships PathQL nests on) without any write
+access or DDL. The response is `text/plain` DBML:
+
+```dbml
+Project {
+  database_type: 'PostgreSQL'
+}
+
+Table "posts" {
+  "id" bigint [pk, not null]
+  "category_id" bigint [not null]
+  "content" text
+}
+
+Ref: "posts"."category_id" > "categories"."id"
+```
+
+It is read-only and PostgreSQL-only (other drivers get `501`). It authenticates
+like `/pathql` and runs on the caller's own connection, so in
+[`login_role`](#row-level-security) mode PostgreSQL's `information_schema`
+restricts the output to exactly the tables that role was granted, the same set
+the caller can query. The metrics and admin principals are forbidden, and the
+response is subject to `max_response_bytes`.
 
 ## Examples
 

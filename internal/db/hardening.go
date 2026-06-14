@@ -14,10 +14,14 @@ import (
 // from weaker ones worth surfacing (Warnings).
 type HardeningReport struct {
 	// Critical findings break the boundary the whole design rests on: a
-	// superuser role (bypasses RLS and read-only) or a role that can write.
+	// superuser or BYPASSRLS role (bypasses RLS and read-only), a role that can
+	// write, or - when RLS is the enforced boundary - a readable table with no
+	// row-level security.
 	Critical []string
 	// Warnings are findings to surface but not necessarily fatal: executable
-	// file/sleep/large-object functions, or readable tables without RLS.
+	// file/sleep/large-object functions, readable tables without RLS (outside
+	// enforce mode), owner-bypassable (non-forced) RLS, or RLS enabled with no
+	// policy.
 	Warnings []string
 }
 
@@ -25,15 +29,22 @@ type HardeningReport struct {
 func (r *HardeningReport) Empty() bool { return len(r.Critical) == 0 && len(r.Warnings) == 0 }
 
 // VerifyHardening runs read-only catalog queries to check the connected role's
-// posture: it is not a superuser, has no write privileges outside the auth
-// tables, cannot execute file/sleep/large-object functions, and that every
-// table it can read has row-level security enabled. It is PostgreSQL-specific;
-// for any other driver it returns an empty report.
+// posture: it is not a superuser, does not hold the BYPASSRLS attribute, has no
+// write privileges outside the auth tables, cannot execute
+// file/sleep/large-object functions, and that every table it can read has
+// row-level security enabled and forced. It is PostgreSQL-specific; for any
+// other driver it returns an empty report.
 //
 // authTablePrefix scopes out the server's own auth tables, which it legitimately
 // reads and updates (last_used_at), so the column-level write grant they need
 // does not register as a finding.
-func VerifyHardening(ctx context.Context, pool *pathsqlx.DB, driver, authTablePrefix string) (*HardeningReport, error) {
+//
+// noRLSIsCritical decides where a readable table with no row-level security is
+// reported: as a Critical finding (when RLS is the security boundary and the
+// operator asked to enforce it) or a Warning. The caller sets it when
+// identity_kind is login_role and startup_checks is enforce, so a silent
+// full-table exposure aborts startup only where RLS is actually relied upon.
+func VerifyHardening(ctx context.Context, pool *pathsqlx.DB, driver, authTablePrefix string, noRLSIsCritical bool) (*HardeningReport, error) {
 	rep := &HardeningReport{}
 	if driver != "postgres" {
 		return rep, nil
@@ -48,6 +59,15 @@ func VerifyHardening(ctx context.Context, pool *pathsqlx.DB, driver, authTablePr
 	if isSuper {
 		rep.Critical = append(rep.Critical,
 			"connected database role is a SUPERUSER: it bypasses row-level security and read-only transactions - connect as a least-privilege login role instead")
+	}
+
+	var bypassRLS bool
+	if err := db.QueryRowContext(ctx, `SELECT rolbypassrls FROM pg_roles WHERE rolname = current_user`).Scan(&bypassRLS); err != nil {
+		return nil, fmt.Errorf("hardening: bypassrls check: %w", err)
+	}
+	if bypassRLS {
+		rep.Critical = append(rep.Critical,
+			"connected database role has the BYPASSRLS attribute: it bypasses every row-level-security policy - run ALTER ROLE ... NOBYPASSRLS")
 	}
 
 	writable, err := scanStrings(ctx, db, `
@@ -100,9 +120,61 @@ LIMIT 50`, like)
 		return nil, fmt.Errorf("hardening: rls-coverage check: %w", err)
 	}
 	if len(noRLS) > 0 {
+		finding := fmt.Sprintf("%d readable table(s) have NO row-level security, so every authenticated caller can read all of their rows: %s",
+			len(noRLS), strings.Join(noRLS, ", "))
+		if noRLSIsCritical {
+			rep.Critical = append(rep.Critical, finding)
+		} else {
+			rep.Warnings = append(rep.Warnings, finding)
+		}
+	}
+
+	// Tables the connected role OWNS whose RLS is enabled but not FORCED: a table
+	// owner bypasses its own (non-forced) policies, so the role would read every
+	// row despite the policy. A least-privilege query role should own nothing;
+	// where it does, RLS must be forced to apply to it.
+	ownedUnforced, err := scanStrings(ctx, db, `
+SELECT n.nspname || '.' || c.relname
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('r','p')
+  AND n.nspname NOT IN ('pg_catalog','information_schema')
+  AND n.nspname !~ '^pg_'
+  AND c.relname NOT LIKE $1
+  AND pg_get_userbyid(c.relowner) = current_user
+  AND c.relrowsecurity AND NOT c.relforcerowsecurity
+ORDER BY 1
+LIMIT 25`, like)
+	if err != nil {
+		return nil, fmt.Errorf("hardening: force-rls check: %w", err)
+	}
+	if len(ownedUnforced) > 0 {
 		rep.Warnings = append(rep.Warnings,
-			fmt.Sprintf("%d readable table(s) have NO row-level security, so every authenticated caller can read all of their rows: %s",
-				len(noRLS), strings.Join(noRLS, ", ")))
+			fmt.Sprintf("connected role OWNS %d table(s) with row-level security enabled but NOT forced, so as the owner it bypasses their policies: %s - run ALTER TABLE ... FORCE ROW LEVEL SECURITY",
+				len(ownedUnforced), strings.Join(ownedUnforced, ", ")))
+	}
+
+	// Tables with RLS enabled but no policy at all: PostgreSQL applies a
+	// default-deny, so these return no rows. That is safe, but is reported so an
+	// operator can tell an intentional lockdown from a forgotten policy.
+	noPolicy, err := scanStrings(ctx, db, `
+SELECT n.nspname || '.' || c.relname
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('r','p')
+  AND n.nspname NOT IN ('pg_catalog','information_schema')
+  AND n.nspname !~ '^pg_'
+  AND c.relname NOT LIKE $1
+  AND has_table_privilege(c.oid,'SELECT')
+  AND c.relrowsecurity
+  AND NOT EXISTS (SELECT 1 FROM pg_policy p WHERE p.polrelid = c.oid)
+ORDER BY 1
+LIMIT 50`, like)
+	if err != nil {
+		return nil, fmt.Errorf("hardening: rls-policy check: %w", err)
+	}
+	if len(noPolicy) > 0 {
+		rep.Warnings = append(rep.Warnings,
+			fmt.Sprintf("%d readable table(s) have row-level security enabled but NO policy, so they return no rows (default-deny); confirm this is intended: %s",
+				len(noPolicy), strings.Join(noPolicy, ", ")))
 	}
 
 	return rep, nil
