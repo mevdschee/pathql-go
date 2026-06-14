@@ -3,8 +3,17 @@ info:
   title: PathQL API
   description: |
     PathQL is a REST API that allows executing SQL queries via HTTP POST requests.
-    It supports parameterized queries and dynamic DSN variable substitution for flexible
-    database connections.
+    It supports parameterized queries and returns nested JSON.
+
+    Requests must be authenticated (API key, HTTP Basic, or JWT Bearer) when the
+    server has authentication enabled, and the request body must be
+    `application/json`. Errors are returned as a generic JSON body; database and
+    driver internals are never returned to the client, only logged server-side.
+
+    Request metrics are exposed at `GET /metrics` on the same listener, but are
+    authorized only for the dedicated metrics principal (the configured
+    `metrics_user`); that principal may read metrics and nothing else. `top_queries`
+    exposes raw query text, so the endpoint is never world-readable.
   version: 1.0.0
   contact:
     name: PathQL
@@ -13,28 +22,42 @@ info:
 servers:
   - url: http://localhost:8000
     description: Local development server
+  - url: https://localhost:8000
+    description: Local server with TLS enabled
+
+security:
+  - ApiKeyHeader: []
+  - BasicAuth: []
+  - BearerJWT: []
 
 paths:
   /pathql:
     post:
       summary: Execute a PathQL query
       description: |
-        Executes a SQL query against the configured database. Supports parameterized queries
-        and dynamic DSN variables for connection string customization.
+        Executes a SQL query against the configured database and returns the
+        result as nested JSON.
 
-        ## DSN Variables
+        ## Authentication
 
-        DSN variables can be specified in the config file using the format `{variableName}`
-        or `{variableName:defaultValue}`.
+        Send one of: the `X-API-Key` header (or `Authorization: ApiKey <key>`),
+        HTTP Basic credentials, or a JWT as `Authorization: Bearer <token>`. The
+        accepted methods depend on the server configuration. The authenticated
+        identity is pushed into a database session variable so row-level security
+        policies filter the result.
 
-        - Variables without defaults are required and must be provided in the request
-        - Variables with defaults are optional and will use the default if not provided
-        - Variable names are case-sensitive and must match exactly
+        ## Query parameters
 
-        ## Query Parameters
+        Query parameters are used for SQL parameterization and follow the sqlx
+        named-parameter format (`:name`). They must be provided as an object, not
+        an array.
 
-        Query parameters are used for SQL parameterization and follow the sqlx named parameter
-        format. Parameters must be provided as an object (not an array).
+        ## Limits
+
+        The request body must be `application/json` and is size-capped. Only a
+        single statement is allowed. The encoded response is size-capped (413 when
+        exceeded). Requests are rate-limited per IP, locked out after repeated
+        auth failures, and capped per user and globally.
       operationId: executeQuery
       tags:
         - Query Execution
@@ -49,9 +72,6 @@ paths:
                 summary: Simple query without parameters
                 value:
                   query: "SELECT 1 AS a, 2 AS b"
-                  variables:
-                    username: "pathql"
-                    password: "pathql"
               parameterizedQuery:
                 summary: Query with parameters
                 value:
@@ -59,22 +79,29 @@ paths:
                   params:
                     userId: 123
                     status: "active"
-                  variables:
-                    username: "pathql"
-                    password: "pathql"
-              customConnection:
-                summary: Query with custom DSN variables
+              queryWithPaths:
+                summary: Query with PATH hints for nested JSON
                 value:
-                  query: "SELECT current_database() AS db"
-                  variables:
-                    host: "db.example.com"
-                    port: "5432"
-                    username: "admin"
-                    password: "secret"
-                    dbname: "production"
+                  query: "SELECT p.id, p.title, c.id, c.body FROM posts p LEFT JOIN comments c ON c.post_id = p.id"
+                  paths:
+                    p: "$"
+                    c: "$.comments[]"
       responses:
         "200":
           description: Query executed successfully
+          headers:
+            X-Request-Id:
+              schema:
+                type: string
+              description: Correlation id, also emitted in server logs.
+            X-Content-Type-Options:
+              schema:
+                type: string
+              description: Always `nosniff`.
+            Cache-Control:
+              schema:
+                type: string
+              description: Always `no-store`.
           content:
             application/json:
               schema:
@@ -98,41 +125,192 @@ paths:
                   summary: Empty result set
                   value: []
         "400":
-          description: Bad request (e.g., invalid parameters format)
+          description: Bad request (malformed body, bad params, or multiple statements)
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
               examples:
+                invalidBody:
+                  summary: Malformed JSON body
+                  value:
+                    type: "Error"
+                    message: "invalid request body"
                 invalidParams:
-                  summary: Invalid params type
+                  summary: Params is not an object
                   value:
                     type: "Error"
                     message: "params must be an object, not an array"
+                multipleStatements:
+                  summary: More than one statement
+                  value:
+                    type: "Error"
+                    message: "only a single statement is allowed"
+        "401":
+          description: Missing or invalid credentials
+          headers:
+            WWW-Authenticate:
+              schema:
+                type: string
+              description: Authentication schemes the server accepts.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                type: "Error"
+                message: "unauthorized"
+        "403":
+          description: |
+            Authenticated but not authorized for this endpoint, e.g. the
+            metrics-only principal attempting to run a query.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                type: "Error"
+                message: "forbidden"
+        "413":
+          description: The encoded response exceeded the configured size cap.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                type: "Error"
+                message: "response too large"
+        "415":
+          description: Request body is not application/json
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                type: "Error"
+                message: "unsupported media type"
+        "429":
+          description: Per-IP rate limit or per-user concurrency cap exceeded
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+              description: Seconds to wait before retrying.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                type: "Error"
+                message: "too many requests"
         "500":
-          description: Server error
+          description: Server error. The message is always generic; details are logged server-side.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                type: "Error"
+                message: "internal error"
+        "503":
+          description: Server busy (global concurrency cap) or the query timed out
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+              description: Seconds to wait before retrying (when the global cap is hit).
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
               examples:
-                missingVariable:
-                  summary: Missing required DSN variable
+                busy:
+                  summary: Global concurrency cap reached
                   value:
                     type: "Error"
-                    message: "missing required DSN variable: username"
-                sqlError:
-                  summary: SQL execution error
+                    message: "server busy"
+                timeout:
+                  summary: Query exceeded the time limit
                   value:
                     type: "Error"
-                    message: "pq: syntax error at or near \"SELEC\""
-                connectionError:
-                  summary: Database connection error
-                  value:
-                    type: "Error"
-                    message: "dial tcp: lookup invalid-host: no such host"
+                    message: "query timed out"
+
+  /metrics:
+    get:
+      summary: Read request metrics
+      description: |
+        Returns request, latency, auth and rejection counters plus the
+        `top_queries` list. Authorized only for the dedicated metrics principal
+        (the configured `metrics_user`); any other authenticated identity gets
+        403, and a missing/invalid credential gets 401. That principal may read
+        metrics and is forbidden on `/pathql`.
+      operationId: readMetrics
+      tags:
+        - Metrics
+      responses:
+        "200":
+          description: Metrics snapshot
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+              example:
+                status_codes: { "200": 1523, "400": 12, "500": 3, "other": 0 }
+                auth: { success: 1502, failure: 33 }
+                rejections: { "429": 7, "503": 0 }
+                top_queries:
+                  - query: "SELECT * FROM users WHERE id = :id"
+                    count: 18234
+                    total_ms: 41210
+                top_users:
+                  - user: "alice"
+                    count: 12044
+                    total_ms: 51230
+        "401":
+          description: Missing or invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                type: "Error"
+                message: "unauthorized"
+        "403":
+          description: Authenticated but not the metrics principal
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+              example:
+                type: "Error"
+                message: "forbidden"
 
 components:
+  securitySchemes:
+    ApiKeyHeader:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: |
+        API key sent in the `X-API-Key` header, or alternatively as
+        `Authorization: ApiKey <key>`. The server stores only a hash of the key
+        and looks it up by a non-secret prefix.
+    BasicAuth:
+      type: http
+      scheme: basic
+      description: |
+        HTTP Basic credentials verified against the configured user table
+        (bcrypt password hashes). Use only over TLS.
+    BearerJWT:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        OAuth2/OIDC JWT access token in `Authorization: Bearer <token>`. Verified
+        by signature (HS256, or RS256/ES256 via a JWKS endpoint), expiry, and the
+        configured issuer and audience.
+
   schemas:
     QueryRequest:
       type: object
@@ -142,7 +320,8 @@ components:
         query:
           type: string
           description: |
-            SQL query to execute. Supports named parameters using the `:paramName` syntax.
+            SQL query to execute. Supports named parameters using the `:paramName`
+            syntax. Must be a single statement.
           example: "SELECT * FROM users WHERE id = :userId"
         params:
           type: object
@@ -153,21 +332,17 @@ components:
           example:
             userId: 123
             status: "active"
-        variables:
+        paths:
           type: object
           description: |
-            DSN variables for database connection customization. Variable names must
-            match exactly (case-sensitive) with the variables defined in the DSN template.
-
-            Required variables (without defaults in DSN) must be provided.
-            Optional variables (with defaults in DSN) can be omitted.
-          additionalProperties: true
+            PATH hints overriding the automatic JSON path inference. Each key is a
+            table alias and each value is the JSON path for that table's columns
+            (a path ending in `[]` is an array; `$` is the root object).
+          additionalProperties:
+            type: string
           example:
-            username: "pathql"
-            password: "pathql"
-            host: "localhost"
-            port: "5432"
-            dbname: "pathql"
+            p: "$"
+            c: "$.comments[]"
 
     QueryResponse:
       type: array
@@ -197,9 +372,13 @@ components:
           example: "Error"
         message:
           type: string
-          description: Human-readable error message
-          example: "missing required DSN variable: username"
+          description: |
+            Generic, human-readable error message. Database and driver internals
+            are never included; they are logged server-side only.
+          example: "internal error"
 
 tags:
   - name: Query Execution
     description: Endpoints for executing SQL queries
+  - name: Metrics
+    description: Operational metrics, restricted to the metrics principal
