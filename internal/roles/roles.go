@@ -74,7 +74,7 @@ type Inputs struct {
 	// Password, when non-nil, makes the DDL set each role's login password to
 	// Password(role): CREATE ROLE ... PASSWORD for new roles and ALTER ROLE ...
 	// PASSWORD for existing ones (so a fresh deployment or a secret rotation keeps
-	// every role's password in sync). Nil means trust/peer auth and no password.
+	// every role's password in sync). Nil emits no password clause.
 	Password func(role string) string
 }
 
@@ -168,8 +168,8 @@ func Compute(in Inputs) (Plan, error) {
 	}
 
 	// AlterPassword: in password mode, every expected role that already exists has
-	// its password (re)set, so a secret rotation or a trust->password switch keeps
-	// all roles in sync. New roles get their password in the CREATE.
+	// its password (re)set, so a secret rotation keeps all roles in sync. New
+	// roles get their password in the CREATE.
 	if in.Password != nil {
 		for name := range expectedNames {
 			if existingSet[name] {

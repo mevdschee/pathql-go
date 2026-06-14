@@ -40,13 +40,56 @@ PATH hint format:
 - If the path ends with `[]`, it's an array; otherwise, it's an object
 - `$` alone means the root is a single object
 
+## Quick start
+
+The simplest setup is one shared database connection and no row-level security,
+which is the default. Point `dsn` at your database:
+
+```ini
+# config.ini
+driver = "postgres"
+dsn    = "host=localhost port=5432 dbname=pathql sslmode=disable"
+listen = ":8000"
+```
+
+Build and run, then send a query:
+
+```sh
+go build -o pathql-server
+./pathql-server
+
+curl -s localhost:8000/pathql \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"SELECT id, content FROM posts WHERE id = :id","params":{"id":1}}'
+# [{ "id": 1, "content": "blog started" }]
+```
+
+That is the whole product: send SQL, get nested JSON (see [Examples](#examples)).
+Everything below is optional hardening you add as you need it: authentication,
+abuse limits, TLS, and per-user row-level security.
+
+There are two identity models, selected by `[security] identity_kind`:
+
+- **`none`** (default): a single shared connection. There is no per-caller
+  isolation, so every authenticated caller runs as the same database role. This
+  is the development / single-tenant on-ramp shown above.
+- **`login_role`**: the server connects as the caller's own per-user database
+  role and PostgreSQL row-level security keys on `current_user`, an unforgeable
+  identity. This is how multi-tenant isolation is enforced; it needs per-role
+  provisioning (see [Row-level security](#row-level-security)).
+
+Each model has a one-command Docker demo: [examples/demo](examples/demo/) for the
+simple shared-connection mode, and [examples/login-role](examples/login-role/)
+for per-user row-level security.
+
 ## Configuration
 
-Create a `config.ini` file in the project root. It is TOML:
+Create a `config.ini` file in the project root. It is TOML. The minimal file
+above is enough to start; the full set of options is:
 
 ```ini
 driver  = "postgres"
-dsn     = "host=localhost port=5432 user=pathql_app password=${PATHQL_DB_PASSWORD} dbname=pathql sslmode=disable"
+dsn     = "host=localhost port=5432 dbname=pathql sslmode=disable"  # identity_kind = "none"
 listen  = ":8000"
 verbose = false
 
@@ -56,16 +99,26 @@ max_idle_conns       = 10
 conn_max_lifetime_ms = 300000
 
 [security]
+identity_kind               = "none"   # "none" (shared dsn, no RLS) or "login_role"
 auth_table_prefix           = "pathql_auth_"
-session_variable            = "app.user"
 read_only                   = true
 metrics_user                = "metrics"
 startup_checks              = "warn"
+# admin_user                = "admin"
 # trusted_proxies = ["10.0.0.0/8", "192.168.0.0/16"]
 
 [auth]
 methods        = ["apikey", "basic"]
 api_key_header = "X-API-Key"
+
+# [roles] is used only when identity_kind = "login_role". Omit it for the shared
+# "none" mode (which uses the top-level dsn instead).
+[roles]
+base_dsn        = "host=localhost port=5432 dbname=pathql sslmode=disable"  # no user=
+baseline_role   = "pathql_auth"
+prefix          = "pathql_r_"
+reader_role     = "pathql_readers"
+password_secret = "${PATHQL_ROLE_SECRET}"
 
 [limits]
 max_query_ms              = 5000
@@ -83,7 +136,6 @@ write_ms = 30000
 idle_ms  = 60000
 
 [cache]
-backend   = "embedded"
 memory_mb = 64
 auth_ttl  = "30s"
 jwks_ttl  = "1h"
@@ -102,7 +154,10 @@ allowed_origins = []
 Top-level options:
 
 - **`driver`**: database driver (e.g. `"postgres"`).
-- **`dsn`**: database connection string. The server holds one fixed credential.
+- **`dsn`**: the shared connection string used when `identity_kind = "none"`
+  (the default). Required in that mode; ignored in `login_role` mode, which uses
+  `[roles] base_dsn` instead. Supports `${ENV}` expansion, and the `PATHQL_DSN`
+  environment variable overrides it verbatim.
 - **`listen`**: listen address serving `POST /pathql` and `GET /metrics`
   (default `:8000`).
 - **`verbose`**: verbose logging (default `false`). When enabled, logs
@@ -110,17 +165,26 @@ Top-level options:
 
 Section options:
 
-- **`[database]`**: connection-pool caps for the single shared pool
-  (`max_open_conns`, `max_idle_conns`, `conn_max_lifetime_ms`).
-- **`[security]`**: see [Row-level security](#row-level-security).
-  `auth_table_prefix` namespaces
-  the auth tables. `metrics_user` is the principal allowed to read `/metrics`
-  (see [Metrics](#metrics)). `startup_checks` controls the
-  [startup hardening check](#startup-hardening-checks). `trusted_proxies` is a
-  list of CIDRs (or bare IPs) whose `RemoteAddr` is trusted to set
-  `X-Forwarded-For` / `X-Real-IP`; the rate limiter uses it to find the real
-  client IP.
+- **`[database]`**: connection-pool caps. In `login_role` mode they apply to each
+  per-role pool (`max_open_conns`, `max_idle_conns`, `conn_max_lifetime_ms`),
+  plus `max_total_backends`, the hard ceiling on connections across all pools.
+- **`[security]`**: `identity_kind` selects the connection/identity model:
+  `"none"` (default, single shared `dsn`, no RLS) or `"login_role"` (per-role
+  connections with `current_user` RLS, see
+  [Row-level security](#row-level-security)). `auth_table_prefix` namespaces the
+  auth tables. `metrics_user` is the principal allowed to read `/metrics` (see
+  [Metrics](#metrics)). `admin_user` gates the [admin routes](#admin-routes).
+  `startup_checks` controls the [startup hardening check](#startup-hardening-checks).
+  `trusted_proxies` is a list of CIDRs (or bare IPs) whose `RemoteAddr` is
+  trusted to set `X-Forwarded-For` / `X-Real-IP`; the rate limiter uses it to
+  find the real client IP.
 - **`[auth]`**: see [Authentication](#authentication).
+- **`[roles]`**: the per-role connection model, used only when
+  `identity_kind = "login_role"`, see [Row-level security](#row-level-security).
+  `base_dsn` is the user-less connection string the server appends `user=<role>`
+  and a derived password to; `baseline_role` is the role used for auth lookups;
+  `prefix` derives a user's role name from its id; `reader_role` is the group
+  granting read access; and `password_secret` derives each role's password.
 - **`[limits]`**: `max_body_bytes` caps the request body and `max_response_bytes`
   caps the encoded response (an oversized result is rejected with `413`).
   `max_query_ms` bounds each query (a Go-side request timeout plus a Postgres
@@ -137,20 +201,21 @@ Section options:
 
 ### Secrets
 
-The DB password should not live in the file in clear text. The `dsn` value
-supports `${ENV}` expansion, so put the password in an environment variable and
-reference it, for example `password=${PATHQL_DB_PASSWORD}`. Tokens that are not
-set expand to the empty string. Alternatively, set `PATHQL_DSN` in the
-environment to override the file `dsn` entirely (used verbatim, no expansion).
-Keep `config.ini` readable only by the server user (`chmod 600`).
+Secrets should not live in the file in clear text. `roles.base_dsn`,
+`roles.password_secret` and `auth.jwt_hs256_secret` support `${ENV}` expansion,
+so put the value in an environment variable and reference it, for example
+`password_secret = "${PATHQL_ROLE_SECRET}"`. Tokens that are not set expand to
+the empty string. Keep `config.ini` readable only by the server user
+(`chmod 600`).
 
 ## Authentication
 
 Authentication is configured in the `[auth]` section. `methods` is an ordered
 list; each request is tried against each method until one succeeds. Supported
 methods are `"apikey"`, `"basic"`, and `"jwt"`. Leaving `methods` empty disables
-authentication entirely; the server logs a clear warning at startup when it
-does.
+authentication entirely (allowed only in `identity_kind = "none"` mode, since
+`login_role` needs a principal to pick a role); the server logs a clear warning
+at startup when it does.
 
 - **`apikey`**: presented as `Authorization: ApiKey <key>` or in the header
   named by `api_key_header` (default `X-API-Key`). The server stores only a
@@ -218,50 +283,34 @@ psql "$DATABASE_URL" -f internal/auth/schema.sql
 
 ## Row-level security
 
-Every query runs inside a read-only transaction (when `read_only = true`) on a
-single connection, with the authenticated identity bound to a Postgres session
-variable named by `session_variable` (default `app.user`). The bind uses
-`set_config(name, value, true)`, the function form of `SET LOCAL`, so the value
-is a bound parameter rather than concatenated SQL and the setting is scoped to
-that transaction. A `statement_timeout` matching `max_query_ms` is set the same
-way.
+Row-level security is the hardened, multi-tenant mode, enabled with
+`[security] identity_kind = "login_role"`. The default `none` mode has **no**
+row-level security: every caller runs on one shared connection as the same
+database role, so use it only for development or a single trusted tenant.
 
-Your row-level-security policies read that value with
-`current_setting('app.user', true)`. The `true` makes the lookup return NULL
-instead of erroring when the variable is unset, so a query that arrives without
-an authenticated identity simply matches no rows. A runnable example, including
-the policy, the `ENABLE ROW LEVEL SECURITY` statements, and the least-privilege
-grants for the application role, is in
-[examples/rls_policy.sql](examples/rls_policy.sql).
+In `login_role` mode the server connects to PostgreSQL **as the caller's own
+database role** and runs the query inside a read-only transaction (when
+`read_only = true`) on that connection. A `statement_timeout` matching
+`max_query_ms` (plus an `idle_in_transaction_session_timeout` and an optional
+`work_mem`) is set transaction-locally via `set_config(name, value, true)`.
 
-The session variable name must be schema-qualified (contain a dot) and is
-validated before use. When no identity is present, no session variable is set.
+Your row-level-security policies read the identity with `current_user`. Because
+the role is fixed by authentication and the PostgreSQL role system enforces
+membership, a query cannot forge another identity, even in a single statement
+(no CTE or function can change `current_user`). This is an unforgeable
+tenant-isolation boundary. A runnable example, including the policy, the
+`ENABLE ROW LEVEL SECURITY` statements, and the least-privilege grants, is in
+[examples/rls_policy.sql](examples/rls_policy.sql). See
+[examples/login-role](examples/login-role/) for a full runnable setup and
+[ROLE_MANAGEMENT_PLAN.md](ROLE_MANAGEMENT_PLAN.md) for the design.
 
-## Identity model (session_guc vs login_role)
+### Role configuration
 
-`[security] identity_kind` selects how the caller's identity reaches row-level
-security:
-
-- **`session_guc`** (default): the server binds the authenticated identity with
-  `set_config('app.user', ..., true)` and policies read `current_setting('app.user', true)`,
-  as described above. One shared pool serves every request. The GUC is only as
-  trustworthy as the query, though: a caller running arbitrary SQL can
-  `set_config('app.user', ...)` to another value, so this mode leans on
-  `block_multiple_statements` and suits single-tenant or trusted-caller setups.
-- **`login_role`**: the server connects to PostgreSQL **as the caller's own
-  database role** and policies read `current_user`. Because the role is fixed by
-  authentication and the role system enforces membership, a query cannot forge
-  another identity, even in a single statement. This is the robust choice for
-  multi-tenant RLS. See [examples/login-role](examples/login-role/) for a runnable
-  setup and [ROLE_MANAGEMENT_PLAN.md](ROLE_MANAGEMENT_PLAN.md) for the design.
-
-### login_role configuration
-
-`login_role` is configured under `[roles]` and needs at least one auth method:
+The per-role model is configured under `[roles]` and needs at least one auth
+method (it needs a principal to pick the role):
 
 - **`base_dsn`**: the connection string **without** a user; the server appends
-  `user=<role>` per connection. Authentication is trust/peer on an isolated
-  channel (or client cert + `pg_ident`), so no per-user password is stored.
+  `user=<role>` and the role's derived password per connection.
 - **`baseline_role`**: the role used for pre-auth work (reading the auth tables)
   before the caller is known. Default `pathql_auth`.
 - **`prefix`**: a user with id N maps to the login role `<prefix>N`
@@ -269,13 +318,12 @@ security:
 - **`reader_role`**: a group role granting read access that every managed role is
   a member of (default `pathql_readers`). Managed roles are never members of each
   other.
-- **`auth`**: how the per-role connections authenticate. `trust` (default) relies
-  on trust/peer on an isolated channel and stores no secret. `password` derives
-  each role's password as `HMAC(password_secret, role)`, includes it in the sync
-  DDL (`CREATE ROLE ... PASSWORD`), and re-derives it at connect time, so no
-  per-role secret is stored; pair it with `scram-sha-256` in `pg_hba.conf` for
-  production. `password_secret` is required for `password` and is `${ENV}`-expandable;
-  the `baseline_role` must also have that derived password set.
+- **`password_secret`** (required): the master secret each per-role connection
+  password is derived from as `HMAC(password_secret, role)`. The same derivation
+  goes into the sync DDL (`CREATE ROLE ... PASSWORD`) and is re-derived at connect
+  time, so no per-role secret is stored. The `baseline_role` must have that
+  derived password set too. Pair it with `scram-sha-256` in `pg_hba.conf` for
+  production. `${ENV}`-expandable; keep it out of the file.
 - **`[database] max_total_backends`** caps total connections across all per-role
   pools (a shared semaphore); **`warm_pool_limit`** bounds how many pools keep
   idle connections. Both are config only.
@@ -304,22 +352,8 @@ are audit-logged.
   role's pool; the role is dropped by the next sync.
 - **`GET /admin/roles/sync`**: returns the role-sync DDL (`create`, `grant_reader`,
   `drop`, and the ordered `ddl`) for a cron job to apply. login_role only.
-- **`GET`/`PUT /admin/pool`**: read or set the global pool defaults (persisted,
-  applied live), with per-pool `db.Stats`. login_role only.
-- **`PUT`/`DELETE /admin/users/{id}/pool`**: set or clear a per-user pool
-  override. login_role only.
 
-## Multiple statements
-
-With `block_multiple_statements = true` (the default), a query that contains more
-than one statement is rejected with a generic `400` before it reaches the
-database. The check is a conservative lexical scan: it counts a `;` that is not
-inside a string literal, a quoted identifier, a dollar-quoted string, or a
-comment. A single optional trailing `;` is allowed. This is not a full SQL
-parser, it errs toward rejection, so a query it is unsure about is refused rather
-than passed through. Combined with the read-only transaction and a
-least-privilege role, it blocks stacked-query injection such as
-`SELECT 1; DROP TABLE ...`.
+Connection-pool sizing is set in `[database]` config, not at runtime.
 
 ## Rate limiting and concurrency
 
@@ -350,8 +384,8 @@ the cache (see below).
 ## Cache
 
 The `[cache]` section configures a small in-process cache used for the rate-limit
-counters and for caching fetched JWKS documents. Only the `embedded` backend is
-supported; it is bounded to `memory_mb` MiB. `auth_ttl` and `jwks_ttl` are
+counters and for caching fetched JWKS documents. It is bounded to `memory_mb`
+MiB. `auth_ttl` and `jwks_ttl` are
 duration strings (e.g. `"30s"`, `"1h"`); `jwks_ttl` is how long a fetched JWKS
 document is reused before refetching.
 
@@ -437,7 +471,7 @@ go test ./...
 End-to-end tests drive the real HTTP stack against a live PostgreSQL: they seed
 the auth tables and a row-level-security demo table, then exercise API-key,
 Basic and JWT authentication, RLS isolation per principal, read-only
-enforcement, multi-statement blocking and rate limiting over HTTP. They are
+enforcement and rate limiting over HTTP. They are
 behind the `e2e` build tag and skip cleanly when no database is reachable:
 
 ```sh

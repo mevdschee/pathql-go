@@ -1,5 +1,5 @@
--- Demo data for pathql-server. Runs once, as the postgres superuser (which
--- bypasses row-level security), right after 01-schema.sql.
+-- Demo data for pathql-server. Runs once, as the postgres superuser, right
+-- after 01-schema.sql.
 
 -- ---------------------------------------------------------------------------
 -- Content. These exact rows reproduce the responses documented in
@@ -21,16 +21,9 @@ INSERT INTO comments (id, post_id, message) VALUES
   (4, 2, 'cool');
 
 -- ---------------------------------------------------------------------------
--- RLS demo rows: alice owns two, bob owns one.
--- ---------------------------------------------------------------------------
-INSERT INTO documents (id, owner, body) VALUES
-  (1, 'alice', 'alice private note one'),
-  (2, 'alice', 'alice private note two'),
-  (3, 'bob',   'bob private note');
-
--- ---------------------------------------------------------------------------
--- Principals. Passwords are bcrypt-hashed with pgcrypto (Basic auth); the demo
--- passwords are alice-password and bob-password. app_user is what RLS sees.
+-- Principals. The Basic password is bcrypt-hashed with pgcrypto; the demo
+-- password is alice-password. app_user is the recorded identity (it has no
+-- effect on queries in this no-RLS mode, but it is what /metrics attributes to).
 --
 -- "metrics" is a dedicated read-only-metrics principal: it has app_user
 -- 'metrics' (the configured metrics_user), so the server lets it read GET
@@ -38,7 +31,6 @@ INSERT INTO documents (id, owner, body) VALUES
 -- ---------------------------------------------------------------------------
 INSERT INTO pathql_auth_users (username, password_hash, app_user) VALUES
   ('alice',   crypt('alice-password', gen_salt('bf', 10)), 'alice'),
-  ('bob',     crypt('bob-password',   gen_salt('bf', 10)), 'bob'),
   ('metrics', NULL,                                         'metrics');
 
 -- API keys. The server stores only sha-256(key) and the first 8 characters as

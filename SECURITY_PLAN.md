@@ -1,52 +1,33 @@
 # Security plan
 
-This document plans authentication, an `app_user` session variable for row-level
-security, and a set of abuse/resource protections for pathql-server. It also
-collects a checklist of common API security best practices.
+This document covers authentication, the per-role connection model for row-level
+security, and the abuse/resource protections for pathql-server, plus a checklist
+of common API security best practices.
 
-## 1. Current state and threat model
+## 1. Threat model
 
-pathql-server today accepts a raw SQL string over `POST /pathql` and runs it.
-The key facts that shape this plan:
-
-- There is no authentication. Anyone who can reach the port can run any SQL the
-  database role allows.
-- The DSN template requires `{username}` and `{password}` with no defaults, so
-  the client currently supplies database credentials per request through the
-  `variables` field. That client-controlled DSN also lets a caller change
-  `host`, so it is an SSRF and credential-injection vector. This must change:
-  the server should hold one fixed, least-privilege credential and authenticate
-  callers at the application layer instead.
-- `pathsqlx.Connect` is called per request and the pool is never closed (leak,
-  no connection caps).
-- `/metrics` is public and leaks raw query text via `top_queries`.
-- Errors return `err.Error()` verbatim (database internals leak to clients).
-- No HTTP read/write/idle timeouts, no request body cap, no panic recovery, no
-  per-query timeout.
-
-Threat model: the product is "send SQL, get JSON." The real security boundary is
-therefore the **database role plus row-level security (RLS)**, not query
-parsing. Authentication decides _who_ the caller is; the `app_user` session
-variable carries that identity into the database so RLS policies can enforce
-_what_ they may see. The HTTP-layer limits below protect availability.
+The product is "send SQL, get JSON," so the real security boundary is the
+**database role plus row-level security (RLS)**, not query parsing.
+Authentication decides _who_ the caller is; the server then connects as that
+caller's own database role so RLS policies can enforce _what_ they may see. The
+HTTP-layer limits below protect availability.
 
 ## 2. Goals
 
 1. Authenticate every request using the common methods (API key, JWT, HTTP
    Basic), pluggable so more can be added.
 2. Resolve the caller to a user record in a configurable `pathql_auth_`-prefixed
-   table, then expose that identity to SQL as a configurable session variable
-   (default name discussed below) so RLS can use it.
+   table, then connect as the caller's own database role so RLS can read
+   `current_user`.
 3. Add resource and abuse protections: per-query timeout, per-user concurrency
    cap, per-IP rate limit, global caps, body-size cap.
-4. Close the current information-disclosure and SSRF gaps.
 
-## 3. Part A — Authentication and the `app_user` session variable
+## 3. Part A — Authentication and identity
 
 ### 3.1 Auth tables (`pathql_auth_` prefix, configurable)
 
 A configurable prefix (`AuthTablePrefix`, default `pathql_auth_`) lets an
-operator namespace the auth tables. Proposed schema (PostgreSQL):
+operator namespace the auth tables. Schema (PostgreSQL):
 
 ```sql
 -- principals
@@ -54,7 +35,7 @@ CREATE TABLE pathql_auth_users (
   id            bigserial PRIMARY KEY,
   username      text NOT NULL UNIQUE,
   password_hash text,                      -- argon2id/bcrypt; null disables Basic
-  app_user      text NOT NULL,             -- value pushed into the session variable
+  app_user      text NOT NULL,             -- application principal name (audit, metrics, limits)
   enabled       boolean NOT NULL DEFAULT true,
   created_at    timestamptz NOT NULL DEFAULT now()
 );
@@ -75,9 +56,10 @@ CREATE TABLE pathql_auth_api_keys (
 
 Notes:
 
-- The `app_user` column decouples the login identity from the value RLS sees (it
-  can be the username, a tenant id, or a database role name). Default it to
-  `username`.
+- The `app_user` column is the application principal name, used for audit logs,
+  the per-user concurrency cap, and metrics; the user row's id maps to its
+  database login role, which is what RLS keys on via `current_user`. Default
+  `app_user` to `username`.
 - API keys and passwords are never stored in clear text. API keys: store
   `sha-256(key)`; look up by a non-secret prefix, then compare the hash in
   constant time. Passwords: argon2id (preferred) or bcrypt.
@@ -92,8 +74,8 @@ configurable:
 
 ```go
 type Principal struct {
-    AppUser string   // value for the session variable
-    UserID  int64
+    AppUser string   // application principal name (audit, metrics, limits)
+    UserID  int64    // maps to the caller's database role
     Scopes  []string
 }
 
@@ -137,66 +119,40 @@ Resolution rules:
   from the same key or IP (brute-force protection).
 - Fail closed: if auth is enabled but misconfigured, deny.
 
-### 3.3 Pushing identity into the database (`app_user`)
+### 3.3 Pushing identity into the database (`current_user`)
 
-After authentication, the resolved `AppUser` must be visible to the SQL that
-runs, so RLS can read it with `current_setting(...)`. Two correctness
-constraints:
+After authentication, the resolved principal must reach the SQL that runs so RLS
+can isolate rows. The server connects to PostgreSQL **as the caller's own
+database role** and lets RLS read `current_user`.
 
-- **Same connection.** The variable must be set on the exact connection that
-  runs the query. `pathsqlx.PathQuery` calls `db.NamedQuery` against the pool,
-  so a `SET` issued on a different pooled connection would not apply.
-- **No leakage across requests.** A pooled connection is reused, so a value set
-  for one caller must not bleed into the next.
+- A user with id N maps to the managed login role `<prefix>N` (default prefix
+  `pathql_r_`). The server keeps a per-role connection pool, authenticating each
+  connection with a password derived as `HMAC(roles.password_secret, role)`.
+- The query runs inside a read-only transaction on that connection, with a
+  transaction-local `statement_timeout` (plus
+  `idle_in_transaction_session_timeout` and an optional `work_mem`) set via
+  `set_config(name, value, true)`, the bound-parameter form of `SET LOCAL`.
+- RLS policies read `current_user`. Because the connected role is fixed at
+  authentication and the role system enforces membership, a query cannot forge
+  another identity, even inside a single statement (no CTE or `set_config` can
+  change `current_user`). The identity boundary lives in the database, not in
+  anything the request can set.
 
-The leak-safe pattern (the same one PostgREST uses) is to run each query inside
-a transaction and use `SET LOCAL`, which resets automatically at
-COMMIT/ROLLBACK:
+The server never creates roles and never holds `CREATEROLE`.
+`GET /admin/roles/sync` emits the exact `CREATE ROLE` / `GRANT` / `DROP ROLE` DDL
+to make the database roles match the users table; an operator or cron applies it.
+See ROLE_MANAGEMENT_PLAN.md for the design.
 
-```sql
-BEGIN;
-SET LOCAL "app.user" = $1;          -- the authenticated identity
-SET LOCAL statement_timeout = '5000ms';
--- ... the user's query runs here, on this same connection ...
-COMMIT;
-```
-
-RLS then reads it with `current_setting('app.user', true)`.
-
-PostgreSQL detail worth flagging: a **custom** run-time parameter must be
-schema-qualified (contain a dot), e.g. `app.user` or `pathql.user`. A bare
-`app_user` raises "unrecognized configuration parameter." The request asked for
-`app_user`; I recommend defaulting the configurable name to **`app.user`** for
-this reason, and documenting it. The config key (`SessionVariable`) stays
-configurable.
-
-This requires running the user query inside the transaction we opened. pathsqlx
-does not currently accept a context or transaction. Options, in order of
-preference:
-
-- **(Recommended) Extend pathsqlx** with `PathQueryContext(ctx, ...)` and a way
-  to run on a caller-supplied `*sqlx.Tx`/`*sql.Conn`. You maintain pathsqlx, so
-  this is the clean fix and also unlocks per-query context timeouts (below).
-- **Interim, no pathsqlx change:** grab a dedicated `*sql.Conn` from a shared
-  pool, `set_config('app.user', $1, false)`, run the query on that conn, then
-  reset with `RESET "app.user"` (or `DISCARD ALL`) before returning it to the
-  pool. Still needs pathsqlx to run on a given conn; if that is not available,
-  the last-resort hack is a per-request pool with `SetMaxOpenConns(1)` so the
-  `SET` and the query share the single connection.
-
-Driver note: the above is PostgreSQL, the primary target. Other drivers use
-different SQL for the same idea (for example MySQL/MariaDB set a `@app_user`
-user-defined variable and cap runtime with
-`max_statement_time`/`max_execution_time` rather than `statement_timeout`), so
-the session-variable and timeout SQL should be a small per-driver strategy. Keep
-PostgreSQL as the first and primary target.
+Driver note: this is PostgreSQL, the primary target. The role / `current_user`
+mechanism is Postgres-specific and has no portable equivalent, so the per-role
+identity model targets PostgreSQL only.
 
 ## 4. Part B — Resource and abuse protection
 
 ### 4.1 Max runtime per query
 
 - Server side: `context.WithTimeout(req.Context(), MaxQueryDuration)` passed
-  into a context-aware query (needs pathsqlx context support).
+  into the context-aware query.
 - Database side (defense in depth): `SET LOCAL statement_timeout` in the same
   transaction (PostgreSQL) so the database also kills a runaway query even if
   the Go side is blocked. Return `503`/`504` with a generic message on timeout.
@@ -230,8 +186,9 @@ PostgreSQL as the first and primary target.
   query length and parameter count.
 - **Result size:** cap rows/bytes returned, or force a `LIMIT`, to stop a single
   query from exhausting memory.
-- **Connection pool:** one shared pool with `SetMaxOpenConns` /
-  `SetMaxIdleConns` / `SetConnMaxLifetime`, replacing per-request `Connect`.
+- **Connection pool:** one pool per database role, each with `SetMaxOpenConns` /
+  `SetMaxIdleConns` / `SetConnMaxLifetime`, plus a global semaphore
+  (`max_total_backends`) capping connections across all pools.
 
 ### 4.5 Caching layer (tqmemory / tqcache)
 
@@ -263,15 +220,20 @@ Extend `config.ini` (TOML supports nested tables; keep the existing flat keys):
 
 ```ini
 driver = "postgres"
-dsn    = "host=localhost port=5432 user=pathql_app password=... dbname=pathql sslmode=require"
 listen = ":8000"
 verbose = false
 
 [security]
 auth_table_prefix = "pathql_auth_"
-session_variable  = "app.user"     # dotted name required for a custom Postgres GUC
 read_only         = true           # run queries in READ ONLY transactions
 trusted_proxies   = ["10.0.0.0/8"] # whose X-Forwarded-For we believe
+
+[roles]
+base_dsn        = "host=localhost port=5432 dbname=pathql sslmode=require" # no user=
+baseline_role   = "pathql_auth"    # role for pre-auth auth-table lookups
+prefix          = "pathql_r_"      # user id N -> role pathql_r_N
+reader_role     = "pathql_readers" # group granting read access
+password_secret = "${PATHQL_ROLE_SECRET}" # derives each role's connection password
 
 [auth]
 methods        = ["apikey", "jwt", "basic"]
@@ -304,8 +266,9 @@ write_ms = 30000
 idle_ms  = 60000
 ```
 
-Secrets (DSN password, JWT HS256 secret) should be loadable from environment
-variables, not only the file, and `config.ini` should be `chmod 600`.
+Secrets (`roles.base_dsn`, `roles.password_secret`, the JWT HS256 secret) should
+be loadable from environment variables, not only the file, and `config.ini`
+should be `chmod 600`.
 
 ## 6. Part D — Request lifecycle (middleware chain)
 
@@ -319,8 +282,9 @@ Order matters: reject cheaply before doing expensive work.
 6. Authentication -> `Principal` on the request context.
 7. Per-user concurrency limiter.
 8. Per-query timeout context.
-9. Handler: open a READ ONLY transaction, `SET LOCAL` the session variable and
-   `statement_timeout`, run the query, COMMIT, encode JSON.
+9. Handler: acquire the caller's per-role connection, open a READ ONLY
+   transaction, `SET LOCAL` the `statement_timeout` (and other limits), run the
+   query, COMMIT, encode JSON.
 
 Make `/metrics` bind to a separate admin listener, since it exposes query text.
 
@@ -331,14 +295,15 @@ A working list of common measures to protect an API, beyond the items above:
 - **Transport:** TLS only (1.2+), HSTS, redirect HTTP to HTTPS; optional mTLS.
 - **Authentication:** multiple schemes, secrets stored hashed, constant-time
   comparison, short-lived tokens, key rotation, revocation.
-- **Authorization:** least privilege. Connect as a restricted DB role; enforce
-  per-row access with RLS keyed on the session variable; never the superuser.
+- **Authorization:** least privilege. Connect as the caller's own restricted DB
+  role; enforce per-row access with RLS keyed on `current_user`; never the
+  superuser. Never take connection-target fields (`host`/`user`/`password`) from
+  the request.
 - **Read-only by default:** run queries in `READ ONLY` transactions and/or grant
   the app role only `SELECT`, so the "send SQL" surface cannot write or run DDL.
   Make write access an explicit, separate opt-in.
-- **Restrict dangerous SQL:** block multiple statements, and at the DB level
-  revoke access to `COPY`, `pg_read_file`, `pg_sleep`, large-object and admin
-  functions.
+- **Restrict dangerous SQL:** at the DB level revoke access to `COPY`,
+  `pg_read_file`, `pg_sleep`, large-object and admin functions.
 - **Rate limiting and throttling:** per IP, per user, and global; `429` with
   `Retry-After`.
 - **Concurrency and timeouts:** in-flight caps, HTTP read/write/idle timeouts,
@@ -346,9 +311,6 @@ A working list of common measures to protect an API, beyond the items above:
 - **Input limits:** max body size, max query length, max params, JSON depth.
 - **Output hygiene:** generic error messages to clients, full detail only in
   server logs; never echo stack traces or driver errors.
-- **Close the DSN injection:** stop accepting client-controlled
-  `host`/`username`/ `password`. If per-request DSN variables stay, whitelist
-  which variables a client may set and forbid connection-target fields.
 - **CORS:** explicit allowed origins, never `*` together with credentials.
 - **Security headers:** `X-Content-Type-Options: nosniff`,
   `Cache-Control: no-store` on sensitive responses, restrictive `Content-Type`
@@ -361,33 +323,8 @@ A working list of common measures to protect an API, beyond the items above:
   gives a base to build on.
 - **Secrets management:** load credentials from env/secret store, restrict file
   permissions, keep secrets out of logs and out of the metrics endpoint.
-- **Dependency hygiene:** update old deps (gorilla/mux 1.7.3, sqlx 1.2.0 are
-  dated) and run vulnerability scanning in CI.
+- **Dependency hygiene:** keep dependencies current and run vulnerability
+  scanning in CI.
 - **Fail closed:** deny when auth or limits are misconfigured rather than
   allowing.
 - **Health/metrics isolation:** protect or separate operational endpoints.
-
-## 8. Suggested phasing
-
-1. Foundation and quick wins: shared pool with caps, HTTP timeouts, body cap,
-   panic recovery, generic errors, lock down DSN variables, gate `/metrics`.
-2. Authentication core: `Authenticator` interface, API key + Basic against the
-   `pathql_auth_` tables, `Principal` on context.
-3. Session variable: extend pathsqlx for context/transaction, READ ONLY
-   transaction with `SET LOCAL`, example RLS policy and docs.
-4. JWT/OIDC: signature verification, JWKS caching, claim mapping.
-5. Abuse protection: wire in the `tqmemory` cache (4.5), per-IP rate limit,
-   per-user and global concurrency, `Retry-After`, metrics for limits and auth
-   failures.
-
-## 9. Open decisions
-
-- PostgreSQL only first, or MySQL/others in parallel? (RLS and the SET syntax
-  differ.)
-- Session variable name: default to `app.user` (dotted, required by Postgres)
-  while keeping it configurable, or insist on the literal `app_user`?
-- Extend pathsqlx for context/transaction support (recommended), or use the
-  single-connection interim approach?
-- JWT: trust verified tokens, or always require a matching enabled user row?
-- Cache backend: ship with embedded `tqmemory` only for now, or add the shared
-  `tqmemory`/`tqcache` sidecar mode up front for multi-instance deployments?

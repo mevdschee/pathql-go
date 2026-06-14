@@ -16,21 +16,28 @@ import (
 	"github.com/mevdschee/pathql-go/internal/auth"
 	"github.com/mevdschee/pathql-go/internal/cache"
 	"github.com/mevdschee/pathql-go/internal/config"
+	"github.com/mevdschee/pathql-go/internal/db"
 )
 
 // setTestConfig installs a minimal valid *config.Config into the package-level
 // cfg for the duration of the test. PathQlEndpoint now reads cfg (RLS options,
-// timeout, multi-statement policy), so handler tests must provide one.
+// timeout, role prefix), so handler tests must provide one.
 func setTestConfig(t *testing.T) {
 	t.Helper()
 	old := cfg
 	cfg = &config.Config{}
-	cfg.Security.SessionVariable = "app.user"
 	cfg.Security.ReadOnly = true
-	cfg.Security.BlockMultipleStatements = true
+	cfg.Security.IdentityKind = "login_role"
+	cfg.Roles.Prefix = "pathql_r_"
 	cfg.Limits.MaxQueryMs = 5000
 	cfg.Limits.MaxBodyBytes = 1048576
 	t.Cleanup(func() { cfg = old })
+}
+
+// withPrincipal returns a copy of req carrying an authenticated principal, as the
+// auth middleware would set after a successful login.
+func withPrincipal(req *http.Request, appUser string, userID int64) *http.Request {
+	return req.WithContext(auth.WithPrincipal(req.Context(), &auth.Principal{AppUser: appUser, UserID: userID}))
 }
 
 // errUnreachable is the canonical "driver could not connect" error. Its text is
@@ -65,6 +72,25 @@ func setUnreachablePool(t *testing.T) {
 	t.Cleanup(func() {
 		_ = p.DB.DB.Close()
 		pool = old
+	})
+}
+
+// setUnreachableRolePools points the package-level rolePools manager at the
+// unreachable driver. pathsqlx.Open is lazy, so Acquire succeeds and the failure
+// surfaces only when RunQuery dials a connection, exercising the DB-error path a
+// caller query takes in the per-role model.
+func setUnreachableRolePools(t *testing.T) {
+	t.Helper()
+	rp, err := db.NewRolePoolsWithOpener(unreachableDriverName, "host=unreachable", 10, 4,
+		db.PoolParams{MaxOpen: 4, MaxIdle: 2}, pathsqlx.Open)
+	if err != nil {
+		t.Fatalf("role pools: %v", err)
+	}
+	old := rolePools
+	rolePools = rp
+	t.Cleanup(func() {
+		_ = rp.Close()
+		rolePools = old
 	})
 }
 
@@ -110,10 +136,10 @@ func TestPathQlEndpointArrayParams(t *testing.T) {
 // contain raw driver text.
 func TestPathQlEndpointGenericErrorOnDBFailure(t *testing.T) {
 	setTestConfig(t)
-	setUnreachablePool(t)
+	setUnreachableRolePools(t)
 
-	req := httptest.NewRequest(http.MethodPost, "/pathql",
-		strings.NewReader(`{"query":"SELECT 1"}`))
+	req := withPrincipal(httptest.NewRequest(http.MethodPost, "/pathql",
+		strings.NewReader(`{"query":"SELECT 1"}`)), "alice", 1)
 	rw := httptest.NewRecorder()
 
 	PathQlEndpoint(rw, req)
@@ -187,79 +213,6 @@ func TestAuthMiddlewareRejects(t *testing.T) {
 	}
 }
 
-// TestPathQlEndpointBlocksMultipleStatements verifies that, with the policy on,
-// a stacked query is rejected with a generic 400 before it ever reaches the
-// database (the pool is left unreachable to prove it is never queried).
-func TestPathQlEndpointBlocksMultipleStatements(t *testing.T) {
-	setTestConfig(t)
-	setUnreachablePool(t)
-
-	req := httptest.NewRequest(http.MethodPost, "/pathql",
-		strings.NewReader(`{"query":"SELECT 1; DROP TABLE users"}`))
-	rw := httptest.NewRecorder()
-
-	PathQlEndpoint(rw, req)
-
-	if rw.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400, got %d (body %q)", rw.Code, rw.Body.String())
-	}
-	body := rw.Body.String()
-	if !strings.Contains(body, "single statement") {
-		t.Errorf("expected single-statement message, got %q", body)
-	}
-}
-
-// TestPathQlEndpointAllowsTrailingSemicolon verifies a single trailing semicolon
-// is NOT treated as multiple statements (it reaches the DB and fails there with
-// a generic 500 against the unreachable pool).
-func TestPathQlEndpointAllowsTrailingSemicolon(t *testing.T) {
-	setTestConfig(t)
-	setUnreachablePool(t)
-
-	req := httptest.NewRequest(http.MethodPost, "/pathql",
-		strings.NewReader(`{"query":"SELECT 1;"}`))
-	rw := httptest.NewRecorder()
-
-	PathQlEndpoint(rw, req)
-
-	if rw.Code != http.StatusInternalServerError {
-		t.Fatalf("expected 500 (reaches unreachable DB), got %d (body %q)", rw.Code, rw.Body.String())
-	}
-}
-
-// TestHasMultipleStatements covers the conservative stacked-query detector.
-func TestHasMultipleStatements(t *testing.T) {
-	cases := []struct {
-		name string
-		sql  string
-		want bool
-	}{
-		{"single", "SELECT 1", false},
-		{"single trailing semicolon", "SELECT 1;", false},
-		{"single trailing semicolon and spaces", "SELECT 1;   \n  ", false},
-		{"trailing semicolon then line comment", "SELECT 1; -- done", false},
-		{"trailing semicolon then block comment", "SELECT 1; /* done */", false},
-		{"two statements", "SELECT 1; SELECT 2", true},
-		{"two statements both terminated", "SELECT 1; SELECT 2;", true},
-		{"double semicolon empty statement", "SELECT 1;;", true},
-		{"injection", "SELECT 1; DROP TABLE users", true},
-		{"semicolon inside single quotes", "SELECT 'a; b'", false},
-		{"semicolon inside double-quoted identifier", `SELECT "co;l" FROM t`, false},
-		{"semicolon inside line comment", "SELECT 1 -- a; b\n", false},
-		{"semicolon inside block comment", "SELECT 1 /* a; b */", false},
-		{"escaped quote then real separator", "SELECT 'it''s'; SELECT 2", true},
-		{"dollar quoted body with semicolon", "SELECT $$a; b$$", false},
-		{"tagged dollar quote with semicolon", "SELECT $tag$a; b$tag$", false},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if got := hasMultipleStatements(c.sql); got != c.want {
-				t.Errorf("hasMultipleStatements(%q) = %v, want %v", c.sql, got, c.want)
-			}
-		})
-	}
-}
-
 func TestMetricsEndpointTopUsers(t *testing.T) {
 	topUsers.Record("u-metrics-test", 40)
 	topUsers.Record("u-metrics-test", 60) // count 2, total 100
@@ -301,14 +254,13 @@ func TestPublicChainRateLimits(t *testing.T) {
 	defer c.Close()
 
 	// A tiny per-IP budget so we can trip it deterministically. No auth chain
-	// (nil) so requests reach the handler without credentials; the handler will
-	// hit the unreachable pool, but the rate limiter sits before it so the first
-	// requests just return 500 and the over-limit one returns 429.
+	// (nil) so requests reach the handler without credentials; with no principal
+	// the handler returns 401, but the rate limiter sits before it so the first
+	// requests pass through and the over-limit one returns 429.
 	lc := *cfg
 	lc.Limits.MaxRequestsPerMinIP = 2
 	lc.Limits.MaxConcurrentGlobal = 100
 	lc.Limits.MaxConcurrentPerUser = 100
-	setUnreachablePool(t)
 
 	h := publicHandler(&lc, nil, c, nil)
 
@@ -322,12 +274,13 @@ func TestPublicChainRateLimits(t *testing.T) {
 		return rw.Code
 	}
 
-	// First two are allowed (reach the handler -> 500 from unreachable pool).
-	if code := send(); code != http.StatusInternalServerError {
-		t.Fatalf("request 1: expected 500, got %d", code)
+	// First two are allowed through the limiter (reach the handler -> 401, no
+	// principal). The third exceeds the per-minute budget before the handler.
+	if code := send(); code != http.StatusUnauthorized {
+		t.Fatalf("request 1: expected 401, got %d", code)
 	}
-	if code := send(); code != http.StatusInternalServerError {
-		t.Fatalf("request 2: expected 500, got %d", code)
+	if code := send(); code != http.StatusUnauthorized {
+		t.Fatalf("request 2: expected 401, got %d", code)
 	}
 	// Third exceeds the per-minute budget.
 	if code := send(); code != http.StatusTooManyRequests {

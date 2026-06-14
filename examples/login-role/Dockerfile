@@ -13,5 +13,5 @@ RUN CGO_ENABLED=0 go build -o /out/pathql-server .
 FROM gcr.io/distroless/static-debian12
 WORKDIR /app
 COPY --from=build /out/pathql-server /app/pathql-server
-EXPOSE 8000
+EXPOSE 8000 8001
 ENTRYPOINT ["/app/pathql-server"]

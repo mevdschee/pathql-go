@@ -354,70 +354,6 @@ paths:
         "401": { description: "Missing or invalid credentials" }
         "403": { description: "Not the admin principal" }
 
-  /admin/pool:
-    get:
-      summary: Read pool settings and stats
-      description: The effective global pool defaults, the config-only ceilings, and live per-pool stats. login_role only. Admin only.
-      operationId: adminGetPool
-      tags: [Admin]
-      responses:
-        "200":
-          description: Pool settings and stats
-          content:
-            application/json:
-              example:
-                global: { max_open: 50, max_idle: 10, conn_max_lifetime_ms: 300000, conn_max_idle_time_ms: 60000 }
-                max_total_backends: 200
-                warm_pool_limit: 64
-                pools: { "pathql_r_2": { max_open_connections: 50, open_connections: 2, in_use: 0, idle: 2, wait_count: 0, wait_duration_ms: 0 } }
-        "400": { description: "Not in login_role mode" }
-        "401": { description: "Missing or invalid credentials" }
-        "403": { description: "Not the admin principal" }
-    put:
-      summary: Set global pool defaults
-      description: Persists the global pool defaults and applies them live to every pool without an override. login_role only. Admin only.
-      operationId: adminPutPool
-      tags: [Admin]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: "#/components/schemas/PoolParams" }
-      responses:
-        "200": { description: "Applied", content: { application/json: { example: { global: { max_open: 7, max_idle: 2, conn_max_lifetime_ms: 120000, conn_max_idle_time_ms: 30000 } } } } }
-        "400": { description: "Invalid params (e.g. max_open over max_total_backends) or not login_role" }
-        "401": { description: "Missing or invalid credentials" }
-        "403": { description: "Not the admin principal" }
-
-  /admin/users/{id}/pool:
-    put:
-      summary: Set a per-user pool override
-      operationId: adminPutUserPool
-      tags: [Admin]
-      parameters:
-        - { name: id, in: path, required: true, schema: { type: integer } }
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema: { $ref: "#/components/schemas/PoolParams" }
-      responses:
-        "200": { description: "Override set" }
-        "400": { description: "Invalid params or not login_role" }
-        "401": { description: "Missing or invalid credentials" }
-        "403": { description: "Not the admin principal" }
-    delete:
-      summary: Clear a per-user pool override
-      operationId: adminDeleteUserPool
-      tags: [Admin]
-      parameters:
-        - { name: id, in: path, required: true, schema: { type: integer } }
-      responses:
-        "200": { description: "Override cleared" }
-        "400": { description: "Not in login_role mode" }
-        "401": { description: "Missing or invalid credentials" }
-        "403": { description: "Not the admin principal" }
-
 components:
   securitySchemes:
     ApiKeyHeader:
@@ -508,15 +444,6 @@ components:
             Generic, human-readable error message. Database and driver internals
             are never included; they are logged server-side only.
           example: "internal error"
-
-    PoolParams:
-      type: object
-      description: Connection-pool parameters (durations in milliseconds).
-      properties:
-        max_open: { type: integer }
-        max_idle: { type: integer }
-        conn_max_lifetime_ms: { type: integer, format: int64 }
-        conn_max_idle_time_ms: { type: integer, format: int64 }
 
 tags:
   - name: Query Execution

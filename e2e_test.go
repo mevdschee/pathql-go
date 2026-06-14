@@ -2,18 +2,23 @@
 
 // End-to-end tests that drive the real HTTP stack (the same publicHandler /
 // buildAuthChain / MetricsEndpoint wiring main() uses) against a live
-// PostgreSQL. They seed the pathql_auth_ tables and an RLS-protected demo table,
-// then make real requests with real credentials and assert authentication,
-// row-level security, read-only enforcement, multi-statement blocking, rate
+// PostgreSQL. They seed the pathql_auth_ tables, per-user login roles and an
+// RLS-protected demo table, then make real requests with real credentials and
+// assert authentication, row-level security, read-only enforcement, rate
 // limiting, and JWT auth all behave correctly together.
+//
+// Identity is the connected database role: each caller's query runs on a
+// connection authenticated as its own login role (pathql_r_<id>), and the RLS
+// policy compares owner = current_user, an unforgeable boundary.
 //
 // Build-tagged "e2e" so the default `go test ./...` stays hermetic. Run with:
 //
 //	go test -tags e2e -run TestE2E ./...
 //
 // DSN comes from PATHQL_E2E_DSN, defaulting to the same local dev database the
-// pathsqlx tests use. The whole suite skips cleanly if the database is
-// unreachable.
+// pathsqlx tests use. The connecting user must be able to CREATE ROLE (superuser
+// or CREATEROLE); the suite skips cleanly if the database is unreachable or roles
+// cannot be managed.
 package main
 
 import (
@@ -43,6 +48,7 @@ const (
 	e2eDefaultDSN  = "host=localhost port=5432 user=pathql password=pathql dbname=pathql sslmode=disable"
 	e2eAlicePass   = "alice-secret-pw"
 	e2eJWTSecret   = "e2e-hs256-shared-secret"
+	e2eRoleSecret  = "e2e-role-password-secret"
 	e2eAPIKeyAlice = "alicekey0_3f8a1c4d9e2b6f70deadbeefcafef00d" // first 8 chars are the prefix
 )
 
@@ -51,6 +57,20 @@ func e2eDSN() string {
 		return v
 	}
 	return e2eDefaultDSN
+}
+
+// e2eBaseDSN is e2eDSN with any user= and password= tokens removed, the user-less
+// base the per-role pools append "user=<role> password=<derived>" to.
+func e2eBaseDSN() string {
+	parts := strings.Fields(e2eDSN())
+	out := parts[:0]
+	for _, p := range parts {
+		if strings.HasPrefix(p, "user=") || strings.HasPrefix(p, "password=") {
+			continue
+		}
+		out = append(out, p)
+	}
+	return strings.Join(out, " ")
 }
 
 // e2eEnv holds everything a subtest needs to talk to the running stack.
@@ -62,9 +82,9 @@ type e2eEnv struct {
 }
 
 // setupE2E connects to Postgres (skipping the whole suite if unreachable),
-// installs a fresh isolated schema with seeded users / api keys / RLS rows, sets
-// the package globals the handlers read, and registers cleanup that drops the
-// tables and restores the globals.
+// installs a fresh isolated schema with seeded users / api keys / per-user login
+// roles / RLS rows, sets the package globals the handlers read, and registers
+// cleanup that drops the tables and roles and restores the globals.
 func setupE2E(t *testing.T) *e2eEnv {
 	t.Helper()
 
@@ -83,21 +103,33 @@ func setupE2E(t *testing.T) *e2eEnv {
 	usersTable := prefix + "users"
 	keysTable := prefix + "api_keys"
 	docsTable := prefix + "docs"
+	rolePrefix := fmt.Sprintf("e2e_%d_r_", os.Getpid())
+	readerRole := fmt.Sprintf("e2e_%d_readers", os.Getpid())
 
 	sqlDB := p.DB // embedded *sqlx.DB
+	bg := context.Background()
 
 	exec := func(q string, args ...any) {
 		t.Helper()
-		if _, err := sqlDB.ExecContext(context.Background(), q, args...); err != nil {
+		if _, err := sqlDB.ExecContext(bg, q, args...); err != nil {
 			t.Fatalf("setup exec failed: %v\nSQL: %s", err, q)
 		}
 	}
 
-	// Clean any leftovers from a previous aborted run, then build the schema.
+	// Clean any leftovers from a previous aborted run: the tables, then every role
+	// in this run's namespace (the prefix plus the reader group). Best effort.
 	drop := func() {
-		_, _ = sqlDB.ExecContext(context.Background(), "DROP TABLE IF EXISTS "+docsTable)
-		_, _ = sqlDB.ExecContext(context.Background(), "DROP TABLE IF EXISTS "+keysTable)
-		_, _ = sqlDB.ExecContext(context.Background(), "DROP TABLE IF EXISTS "+usersTable)
+		_, _ = sqlDB.ExecContext(bg, "DROP TABLE IF EXISTS "+docsTable)
+		_, _ = sqlDB.ExecContext(bg, "DROP TABLE IF EXISTS "+keysTable)
+		_, _ = sqlDB.ExecContext(bg, "DROP TABLE IF EXISTS "+usersTable)
+		_, _ = sqlDB.ExecContext(bg, fmt.Sprintf(
+			`DO $$DECLARE r record; BEGIN
+			   FOR r IN SELECT rolname FROM pg_roles
+			            WHERE starts_with(rolname, '%s') OR rolname = '%s' LOOP
+			     EXECUTE 'DROP OWNED BY ' || quote_ident(r.rolname);
+			     EXECUTE 'DROP ROLE ' || quote_ident(r.rolname);
+			   END LOOP;
+			 END$$;`, rolePrefix, readerRole))
 	}
 	drop()
 
@@ -122,34 +154,25 @@ func setupE2E(t *testing.T) *e2eEnv {
 		UNIQUE (key_prefix)
 	)`, keysTable, usersTable))
 
-	// RLS demo table. pathql connects as a non-superuser, non-bypassrls role, and
-	// FORCE ROW LEVEL SECURITY makes the policy apply even to the table owner.
-	exec(fmt.Sprintf(`CREATE TABLE %s (
-		id     bigint PRIMARY KEY,
-		tenant text NOT NULL,
-		body   text NOT NULL
-	)`, docsTable))
-	// Seed the RLS rows BEFORE enabling row-level security, otherwise the owner's
-	// own INSERT is denied because no app.user is set during setup.
-	exec(fmt.Sprintf(`INSERT INTO %s (id, tenant, body) VALUES
-		(1,'alice','alice-doc-one'),
-		(2,'alice','alice-doc-two'),
-		(3,'bob','bob-doc-one')`, docsTable))
-	exec(fmt.Sprintf(`ALTER TABLE %s ENABLE ROW LEVEL SECURITY`, docsTable))
-	exec(fmt.Sprintf(`ALTER TABLE %s FORCE ROW LEVEL SECURITY`, docsTable))
-	exec(fmt.Sprintf(`CREATE POLICY %s_isolation ON %s
-		USING (tenant = current_setting('app.user', true))`, docsTable, docsTable))
-
-	// Seed two principals: alice (password + API key) and bob (password only).
+	// Seed two principals: alice (password + API key) and bob (password only),
+	// capturing their ids so we can derive their login-role names.
 	aliceHash, err := bcrypt.GenerateFromPassword([]byte(e2eAlicePass), bcrypt.DefaultCost)
 	if err != nil {
 		t.Fatalf("bcrypt: %v", err)
 	}
-	exec(fmt.Sprintf(`INSERT INTO %s (username, password_hash, app_user, enabled)
-		VALUES ($1,$2,$3,true)`, usersTable), "alice", string(aliceHash), "alice")
 	bobHash, _ := bcrypt.GenerateFromPassword([]byte("bob-secret-pw"), bcrypt.DefaultCost)
-	exec(fmt.Sprintf(`INSERT INTO %s (username, password_hash, app_user, enabled)
-		VALUES ($1,$2,$3,true)`, usersTable), "bob", string(bobHash), "bob")
+
+	var aliceID, bobID int64
+	if err := sqlDB.GetContext(bg, &aliceID, fmt.Sprintf(
+		`INSERT INTO %s (username, password_hash, app_user, enabled) VALUES ($1,$2,$3,true) RETURNING id`,
+		usersTable), "alice", string(aliceHash), "alice"); err != nil {
+		t.Fatalf("insert alice: %v", err)
+	}
+	if err := sqlDB.GetContext(bg, &bobID, fmt.Sprintf(
+		`INSERT INTO %s (username, password_hash, app_user, enabled) VALUES ($1,$2,$3,true) RETURNING id`,
+		usersTable), "bob", string(bobHash), "bob"); err != nil {
+		t.Fatalf("insert bob: %v", err)
+	}
 
 	// API key for alice: store the sha-256 of the full key + its 8-char prefix.
 	sum := sha256.Sum256([]byte(e2eAPIKeyAlice))
@@ -157,23 +180,73 @@ func setupE2E(t *testing.T) *e2eEnv {
 		SELECT id, $1, $2, 'e2e', true FROM %s WHERE username='alice'`, keysTable, usersTable),
 		e2eAPIKeyAlice[:8], sum[:])
 
+	aliceRole := fmt.Sprintf("%s%d", rolePrefix, aliceID)
+	bobRole := fmt.Sprintf("%s%d", rolePrefix, bobID)
+	rolePw := func(role string) string { return rolePassword(e2eRoleSecret, role) }
+
+	// Create the reader group and the per-user login roles. Each role's password
+	// is the same HMAC-derived value the server re-derives from e2eRoleSecret.
+	// Managing roles needs CREATEROLE/superuser; skip cleanly if we lack it.
+	execRoleOrSkip := func(q string) {
+		if _, err := sqlDB.ExecContext(bg, q); err != nil {
+			drop()
+			_ = db.Close(p)
+			t.Skipf("cannot manage login roles (need CREATEROLE or superuser): %v", err)
+		}
+	}
+	execRoleOrSkip(fmt.Sprintf(`CREATE ROLE %s`, readerRole))
+	for _, role := range []string{aliceRole, bobRole} {
+		execRoleOrSkip(fmt.Sprintf(`CREATE ROLE %s LOGIN PASSWORD '%s'`, role, rolePw(role)))
+		execRoleOrSkip(fmt.Sprintf(`GRANT %s TO %s`, readerRole, role))
+	}
+	// Ensure the readers can reach the schema (PUBLIC usually already can).
+	_, _ = sqlDB.ExecContext(bg, fmt.Sprintf(`GRANT USAGE ON SCHEMA public TO %s`, readerRole))
+
+	// RLS demo table. owner holds the managed role NAME, because the policy
+	// compares owner = current_user and current_user is the connected login role.
+	exec(fmt.Sprintf(`CREATE TABLE %s (
+		id    bigint PRIMARY KEY,
+		owner text NOT NULL,
+		body  text NOT NULL
+	)`, docsTable))
+	exec(fmt.Sprintf(`INSERT INTO %s (id, owner, body) VALUES
+		(1,'%s','alice-doc-one'),
+		(2,'%s','alice-doc-two'),
+		(3,'%s','bob-doc-one')`, docsTable, aliceRole, aliceRole, bobRole))
+	exec(fmt.Sprintf(`ALTER TABLE %s ENABLE ROW LEVEL SECURITY`, docsTable))
+	exec(fmt.Sprintf(`ALTER TABLE %s FORCE ROW LEVEL SECURITY`, docsTable))
+	exec(fmt.Sprintf(`CREATE POLICY %s_isolation ON %s
+		FOR SELECT TO %s USING (owner = current_user)`, docsTable, docsTable, readerRole))
+	// Readers may SELECT; the RLS policy then filters to their own rows.
+	exec(fmt.Sprintf(`GRANT SELECT ON %s TO %s`, docsTable, readerRole))
+
 	// Install the package globals the handlers read.
 	c, err := cache.NewEmbedded(16)
 	if err != nil {
 		t.Fatalf("cache: %v", err)
 	}
 
-	oldCfg, oldPool, oldCache := cfg, pool, sharedCache
-	cfg = baseE2EConfig(prefix)
+	defaults := db.PoolParams{MaxOpen: 5, MaxIdle: 2, ConnMaxLifetime: 5 * time.Minute, ConnMaxIdleTime: time.Minute}
+	rp, err := db.NewRolePools(e2eDriver, e2eBaseDSN(), 50, 16, defaults)
+	if err != nil {
+		t.Fatalf("role pools: %v", err)
+	}
+	rp.UseRolePassword(rolePw)
+
+	oldCfg, oldPool, oldRolePools, oldCache := cfg, pool, rolePools, sharedCache
+	cfg = baseE2EConfig(prefix, rolePrefix, readerRole)
 	pool = p
+	rolePools = rp
 	sharedCache = c
 
 	t.Cleanup(func() {
+		_ = rp.Close()
 		drop()
 		_ = db.Close(p)
 		_ = c.Close()
 		cfg = oldCfg
 		pool = oldPool
+		rolePools = oldRolePools
 		sharedCache = oldCache
 	})
 
@@ -181,14 +254,18 @@ func setupE2E(t *testing.T) *e2eEnv {
 }
 
 // baseE2EConfig is a fully-populated config for the running stack with auth on
-// (apikey + basic), RLS via the dotted session variable, and read-only on.
-func baseE2EConfig(prefix string) *config.Config {
-	c := &config.Config{Driver: e2eDriver, DSN: e2eDSN()}
+// (apikey + basic), per-role connections (password auth), and read-only on.
+func baseE2EConfig(prefix, rolePrefix, readerRole string) *config.Config {
+	c := &config.Config{Driver: e2eDriver}
 	c.Security.AuthTablePrefix = prefix
-	c.Security.SessionVariable = "app.user"
 	c.Security.ReadOnly = true
 	c.Auth.Methods = []string{"apikey", "basic"}
 	c.Auth.APIKeyHeader = "X-API-Key"
+	c.Roles.BaseDSN = e2eBaseDSN()
+	c.Roles.PasswordSecret = e2eRoleSecret
+	c.Roles.Prefix = rolePrefix
+	c.Roles.ReaderRole = readerRole
+	c.Roles.BaselineRole = "pathql" // unused by the test (pool is set directly)
 	c.Limits.MaxQueryMs = 5000
 	c.Limits.MaxBodyBytes = 1 << 20
 	c.Limits.MaxConcurrentPerUser = 50
@@ -242,7 +319,7 @@ func TestE2EAuthAndRLS(t *testing.T) {
 	defer srv.Close()
 
 	docs := env.docsTable
-	q := "SELECT id, tenant, body FROM " + docs + " ORDER BY id"
+	q := "SELECT id, owner, body FROM " + docs + " ORDER BY id"
 
 	t.Run("no credentials -> 401", func(t *testing.T) {
 		r := post(t, srv, q, nil)
@@ -306,18 +383,8 @@ func TestE2EAuthAndRLS(t *testing.T) {
 		}
 	})
 
-	t.Run("multi-statement -> 400", func(t *testing.T) {
-		r := post(t, srv, "SELECT 1; DROP TABLE "+docs, map[string]string{"X-API-Key": e2eAPIKeyAlice})
-		if r.status != http.StatusBadRequest {
-			t.Fatalf("status=%d body=%s", r.status, r.body)
-		}
-		if !strings.Contains(r.body, "single statement") {
-			t.Errorf("expected single-statement message, got %s", r.body)
-		}
-	})
-
 	t.Run("read-only tx blocks writes", func(t *testing.T) {
-		ins := fmt.Sprintf("INSERT INTO %s (id, tenant, body) VALUES (999, 'alice', 'should-not-persist') RETURNING id", docs)
+		ins := fmt.Sprintf("INSERT INTO %s (id, owner, body) VALUES (999, 'x', 'should-not-persist') RETURNING id", docs)
 		r := post(t, srv, ins, map[string]string{"X-API-Key": e2eAPIKeyAlice})
 		if r.status == http.StatusOK {
 			t.Fatalf("write unexpectedly succeeded in a read-only tx: %s", r.body)
@@ -348,7 +415,7 @@ func TestE2EJWTAuthWithRLS(t *testing.T) {
 	srv := serveE2E(t)
 	defer srv.Close()
 
-	q := "SELECT id, tenant, body FROM " + env.docsTable + " ORDER BY id"
+	q := "SELECT id, owner, body FROM " + env.docsTable + " ORDER BY id"
 
 	sign := func(sub string, exp time.Time) string {
 		tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
@@ -413,7 +480,7 @@ func TestE2ERateLimitAndMetrics(t *testing.T) {
 	srv := serveE2E(t)
 	defer srv.Close()
 
-	q := "SELECT id, tenant, body FROM " + env.docsTable
+	q := "SELECT id, owner, body FROM " + env.docsTable
 
 	var got429 bool
 	for i := 0; i < 6; i++ {

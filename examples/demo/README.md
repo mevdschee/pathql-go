@@ -1,13 +1,18 @@
-# pathql-server demo
+# pathql-server demo (simple, no-RLS)
 
-A one-command demo: PostgreSQL seeded with auth and sample data, plus the
-pathql-server built from this repo. It reproduces the example queries from the
-[top-level README](../../README.md) and shows authentication and row-level
-security working end to end.
+A one-command demo of the simplest pathql-server setup: PostgreSQL seeded with
+sample data and auth, plus the server connecting as a single shared role. It
+reproduces the example queries from the [top-level README](../../README.md) and
+shows API-key and Basic authentication.
+
+Every request runs as the same database role (`pathql_app`), so there is **no
+per-user isolation**. That is the point of this mode: minimal setup for
+development or a single trusted tenant. For row-level security where each user
+only sees their own rows, see the sibling [examples/login-role](../login-role/)
+demo.
 
 This is a demo, not a hardened deployment: it uses plaintext HTTP on localhost
-and fixed demo credentials. For production settings see the
-[main README](../../README.md) and [../rls_policy.sql](../rls_policy.sql).
+and fixed demo credentials.
 
 ## Prerequisites
 
@@ -23,18 +28,19 @@ From this directory:
 docker compose up --build
 ```
 
-The first run builds the server image and seeds the database; it's ready once
-you see the server log its listen address. Two ports are exposed:
+The first run builds the server image and seeds the database; it is ready once
+the server logs its listen address. Two ports are exposed:
 
-- `localhost:8000` - the API: `POST /pathql` and `GET /metrics` (metrics is
-  gated to the `metrics` user)
+- `localhost:8000` - the API: `POST /pathql` and `GET /metrics`
 - `localhost:5433` - the demo Postgres (only to poke at it directly; the server
   talks to the database over the compose network)
 
-On startup the server runs its hardening self-check against the demo role and
-logs one warning, that `posts`, `comments` and `categories` have no row-level
-security. That is intentional here (they are public sample data); the
-`documents` table does have RLS. Watch it with `docker compose logs server`.
+The demo credentials are:
+
+- API key **`pql_demo_alice_8c1f2a9b4d6e7035`** (app_user `alice`)
+- Basic login **`alice` / `alice-password`**
+- metrics API key **`pql_metrics_3f9a1c7d5e2b8460`** (app_user `metrics`, allowed
+  only on `/metrics`)
 
 Tear everything down, including the database volume, with:
 
@@ -42,33 +48,14 @@ Tear everything down, including the database volume, with:
 docker compose down -v
 ```
 
-## What gets seeded
+## The flow
 
-Content tables (`categories`, `posts`, `comments`) with the exact rows used in
-the main README's examples, plus a `documents` table protected by row-level
-security. Three users:
-
-| user    | password         | API key                            | can do                          |
-|---------|------------------|------------------------------------|---------------------------------|
-| alice   | `alice-password` | `pql_demo_alice_8c1f2a9b4d6e7035`  | query; sees her 2 `documents`   |
-| bob     | `bob-password`   | (none, Basic only)                 | query; sees his 1 `document`    |
-| metrics | (none)           | `pql_metrics_3f9a1c7d5e2b8460`     | read `/metrics` only            |
-
-The `metrics` user has `app_user = 'metrics'` (the configured `metrics_user`), so
-the server lets it read `/metrics` and forbids it on `/pathql`. Conversely alice
-and bob can query but get `403` on `/metrics`.
-
-## Try it
-
-All requests need `Content-Type: application/json` and an authenticated
-identity. Alice authenticates with her API key; bob with HTTP Basic.
-
-### Simple query (flat array)
+### a. A simple query
 
 ```sh
 curl -s localhost:8000/pathql \
-  -H 'Content-Type: application/json' \
   -H 'X-API-Key: pql_demo_alice_8c1f2a9b4d6e7035' \
+  -H 'Content-Type: application/json' \
   -d '{"query":"SELECT id, content FROM posts WHERE id = :id","params":{"id":1}}'
 ```
 
@@ -76,16 +63,21 @@ curl -s localhost:8000/pathql \
 [{ "id": 1, "content": "blog started" }]
 ```
 
-### Join with automatic nesting (posts with comments)
+Basic auth works the same way:
 
-pathsqlx reads the foreign keys to detect the one-to-many relationship and nests
-each post's comments under a sibling `c` array:
+```sh
+curl -s -u alice:alice-password localhost:8000/pathql \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"SELECT id FROM posts ORDER BY id"}'
+```
+
+### b. Automatic nesting: posts with their comments
 
 ```sh
 curl -s localhost:8000/pathql \
-  -H 'Content-Type: application/json' \
   -H 'X-API-Key: pql_demo_alice_8c1f2a9b4d6e7035' \
-  -d '{"query":"SELECT p.id, c.id, c.message FROM posts p LEFT JOIN comments c ON c.post_id = p.id WHERE p.id <= 2 ORDER BY p.id, c.id","params":{}}'
+  -H 'Content-Type: application/json' \
+  -d '{"query":"SELECT p.id, c.id, c.message FROM posts p LEFT JOIN comments c ON c.post_id = p.id ORDER BY p.id, c.id"}'
 ```
 
 ```json
@@ -95,93 +87,36 @@ curl -s localhost:8000/pathql \
 ]
 ```
 
-### PATH hint (nested object root)
+pathsqlx detected the one-to-many relationship from the foreign key and grouped
+the comments under each post. See the [top-level README](../../README.md) for
+more query and PATH-hint examples.
+
+### c. metrics is gated to its own principal
+
+`alice` is a normal user, so `/metrics` is forbidden:
 
 ```sh
-curl -s localhost:8000/pathql \
-  -H 'Content-Type: application/json' \
-  -H 'X-API-Key: pql_demo_alice_8c1f2a9b4d6e7035' \
-  -d '{"query":"SELECT posts.id, comments.id FROM posts LEFT JOIN comments ON post_id = posts.id WHERE posts.id <= 2 ORDER BY posts.id, comments.id","params":{},"paths":{"posts":"$.posts"}}'
+curl -i -s localhost:8000/metrics -H 'X-API-Key: pql_demo_alice_8c1f2a9b4d6e7035'
+# 403
 ```
 
-```json
-{ "posts": [ { "id": 1, "comments": [{ "id": 1 }, { "id": 2 }] }, { "id": 2, "comments": [{ "id": 3 }, { "id": 4 }] } ] }
-```
-
-### Row-level security: alice sees only her documents
-
-```sh
-curl -s localhost:8000/pathql \
-  -H 'Content-Type: application/json' \
-  -H 'X-API-Key: pql_demo_alice_8c1f2a9b4d6e7035' \
-  -d '{"query":"SELECT id, body FROM documents ORDER BY id","params":{}}'
-```
-
-```json
-[{ "id": 1, "body": "alice private note one" }, { "id": 2, "body": "alice private note two" }]
-```
-
-### Row-level security: bob (HTTP Basic) sees only his
-
-The same query returns different rows for a different identity. Nothing in the
-query changes; the policy filters by the bound `app.user`.
-
-```sh
-curl -s -u bob:bob-password localhost:8000/pathql \
-  -H 'Content-Type: application/json' \
-  -d '{"query":"SELECT id, body FROM documents ORDER BY id","params":{}}'
-```
-
-```json
-[{ "id": 3, "body": "bob private note" }]
-```
-
-### No credentials -> 401
-
-```sh
-curl -i -s localhost:8000/pathql \
-  -H 'Content-Type: application/json' \
-  -d '{"query":"SELECT 1 AS one"}'
-```
-
-### Stacked statement -> 400 (blocked before it reaches the database)
-
-```sh
-curl -i -s localhost:8000/pathql \
-  -H 'Content-Type: application/json' \
-  -H 'X-API-Key: pql_demo_alice_8c1f2a9b4d6e7035' \
-  -d '{"query":"SELECT 1; DROP TABLE posts"}'
-```
-
-### Metrics: only the metrics user may read them
-
-The `metrics` user reads `/metrics` with its API key (200):
+The metrics key works:
 
 ```sh
 curl -s localhost:8000/metrics -H 'X-API-Key: pql_metrics_3f9a1c7d5e2b8460'
 ```
 
-alice (a normal user) is forbidden on `/metrics` (403):
+## How it works
+
+1. The server reads `config.ini`, which sets `dsn` to connect as `pathql_app`.
+   With no `identity_kind` set it defaults to `none`: one shared pool, no RLS.
+2. Each request is authenticated against the auth tables (API key or Basic).
+3. The query runs on the shared connection inside a read-only transaction and
+   the nested JSON is returned. Every caller sees the same data; the database
+   does no per-user filtering.
+
+## Teardown
 
 ```sh
-curl -i -s localhost:8000/metrics -H 'X-API-Key: pql_demo_alice_8c1f2a9b4d6e7035'
+docker compose down -v
 ```
-
-and the metrics user is forbidden on `/pathql` (403):
-
-```sh
-curl -i -s localhost:8000/pathql \
-  -H 'Content-Type: application/json' \
-  -H 'X-API-Key: pql_metrics_3f9a1c7d5e2b8460' \
-  -d '{"query":"SELECT 1 AS one"}'
-```
-
-## Notes
-
-- The server logs one line per request (`verbose = true` in `config.ini`); watch
-  it with `docker compose logs -f server`.
-- `config.ini` is bind-mounted read-only, so the server prints a one-line
-  startup warning that the file is group/other-readable. That's expected for the
-  demo; in production keep it `chmod 600`.
-- HTTP Basic is sent in cleartext here because the demo is plaintext localhost.
-  Only use Basic over TLS in real deployments.

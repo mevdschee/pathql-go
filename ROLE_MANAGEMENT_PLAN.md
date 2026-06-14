@@ -7,9 +7,10 @@ builds on the login_role RLS model (identity is `current_user`, the connection
 authenticates as the user's role).
 
 Decisions locked (this revision): build the login_role layer first; per-role
-connections authenticate via trust/peer on an isolated channel (no per-user
-password); the server does NOT hold CREATEROLE, it emits the exact DDL to sync
-roles which a cron job applies out of band; admin routes live on the main
+connections authenticate with a per-role password derived from a master secret
+(`HMAC(secret, role)`, set by the sync DDL and re-derived at connect time, paired
+with scram-sha-256); the server does NOT hold CREATEROLE, it emits the exact DDL
+to sync roles which a cron job applies out of band; admin routes live on the main
 listener gated to `admin_user`.
 
 ## 1. Goal and scope
@@ -32,11 +33,11 @@ This plan assumes the login_role connection layer exists:
 
 - A mapping from the app-authenticated principal to a database role.
 - A per-role connection pool, where each connection authenticates as the user's
-  role: trust/peer on an isolated channel (no secret), or a per-role password
-  derived from a master secret (`HMAC(secret, role)`, set by the sync DDL and
-  re-derived at connect time, paired with scram-sha-256). Client cert plus
-  `pg_ident` is impractical for dynamically created roles (a `pg_ident` line per
-  role plus a reload on every creation), so it is not used.
+  role with a per-role password derived from a master secret (`HMAC(secret,
+  role)`, set by the sync DDL and re-derived at connect time, paired with
+  scram-sha-256). Client cert plus `pg_ident` is impractical for dynamically
+  created roles (a `pg_ident` line per role plus a reload on every creation), so
+  it is not used.
 - RLS policies keyed on `current_user`.
 
 If that layer is not yet built it becomes phase 0 of the build order below.
@@ -209,8 +210,8 @@ admin_user = "admin"          # principal allowed on /admin/*; empty disables th
 - Managed roles are `LOGIN NOSUPERUSER NOCREATEROLE`, members only of the reader
   role, never of each other (the pivot risk).
 - LOGIN roles are only safe because `pg_hba` restricts who may connect as them
-  (the login_role cert or trust setup); the plan documents that pg_hba must not
-  expose them more widely.
+  (scram-sha-256 with the derived per-role password); the plan documents that
+  pg_hba must not expose them more widely.
 - Prefix plus recorded-as-managed check on every drop; `%I` quoting; idempotent
   create and delete.
 - Admin routes gated to `admin_user`, audited, rate limited, TLS expected;
@@ -244,7 +245,7 @@ admin_user = "admin"          # principal allowed on /admin/*; empty disables th
 ## 15. Open decisions
 
 1. login_role prerequisite: plan and build it first as phase 0, or assume the
-   cert or trust plus per-role pool layer is already in place.
+   per-role password plus per-role pool layer is already in place.
 2. Provisioner credential: the server holds a CREATEROLE credential as planned,
    or the DDL is delegated to an admin-run step or rls-polyfill so the server
    never holds CREATEROLE (smaller blast radius, but no fully self-service admin

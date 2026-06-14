@@ -142,6 +142,7 @@ func adminDeleteUser(w http.ResponseWriter, req *http.Request) {
 	resp := map[string]any{"deleted": true, "note": "run the roles sync to drop the role"}
 	if role, rerr := roles.RoleName(cfg.Roles.Prefix, id); rerr == nil {
 		resp["role"] = role
+		// rolePools is nil with identity_kind "none"; there is no per-role pool to evict.
 		if rolePools != nil {
 			rolePools.Evict(role)
 		}
@@ -176,12 +177,9 @@ func rolePassword(secret, role string) string {
 	return hex.EncodeToString(mac.Sum(nil))[:32]
 }
 
-// rolePasswordFunc returns the per-role password derivation closure when the
-// server is in login_role password mode, or nil for trust auth.
+// rolePasswordFunc returns the per-role password derivation closure: every
+// managed role authenticates with a password derived from roles.password_secret.
 func rolePasswordFunc() func(string) string {
-	if cfg.Security.IdentityKind != "login_role" || cfg.Roles.Auth != "password" {
-		return nil
-	}
 	secret := cfg.Roles.PasswordSecret
 	return func(role string) string { return rolePassword(secret, role) }
 }

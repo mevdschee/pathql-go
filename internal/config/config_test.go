@@ -19,16 +19,34 @@ func writeTemp(t *testing.T, content string) string {
 	return path
 }
 
-// minimalValid is the smallest config that passes validation; defaults fill the rest.
+// minimalValid is the smallest config that passes validation; defaults fill the
+// rest. It uses the default identity_kind "none" (a single shared dsn, no RLS),
+// so only driver and dsn are required and auth is optional.
 const minimalValid = `
 driver = "postgres"
 dsn    = "host=localhost dbname=pathql"
 `
 
+// minimalLoginRole is the smallest config that passes validation in login_role
+// mode: a principal (auth method), a user-less base DSN and a role password
+// secret are all required.
+const minimalLoginRole = `
+driver = "postgres"
+
+[security]
+identity_kind = "login_role"
+
+[auth]
+methods = ["apikey"]
+
+[roles]
+base_dsn        = "host=localhost dbname=pathql sslmode=disable"
+password_secret = "test-secret"
+`
+
 func TestLoad_DecodeExplicitValues(t *testing.T) {
 	content := `
 driver       = "mysql"
-dsn          = "user:pass@/db"
 listen       = ":9000"
 verbose      = true
 
@@ -39,13 +57,18 @@ conn_max_lifetime_ms = 1234
 
 [security]
 auth_table_prefix = "myauth_"
-session_variable  = "pathql.user"
+identity_kind     = "login_role"
 read_only         = true
 trusted_proxies   = ["10.0.0.0/8", "192.168.0.0/16"]
 
 [auth]
 methods        = ["apikey", "basic"]
 api_key_header = "X-Key"
+
+[roles]
+base_dsn        = "host=roles dbname=pathql"
+password_secret = "decode-secret"
+prefix          = "myr_"
 
 [limits]
 max_query_ms       = 1000
@@ -68,16 +91,18 @@ idle_ms  = 33
 		want interface{}
 	}{
 		{"Driver", cfg.Driver, "mysql"},
-		{"DSN", cfg.DSN, "user:pass@/db"},
 		{"Listen", cfg.Listen, ":9000"},
 		{"Verbose", cfg.Verbose, true},
 		{"Database.MaxOpenConns", cfg.Database.MaxOpenConns, 7},
 		{"Database.MaxIdleConns", cfg.Database.MaxIdleConns, 3},
 		{"Database.ConnMaxLifetimeMs", cfg.Database.ConnMaxLifetimeMs, 1234},
 		{"Security.AuthTablePrefix", cfg.Security.AuthTablePrefix, "myauth_"},
-		{"Security.SessionVariable", cfg.Security.SessionVariable, "pathql.user"},
+		{"Security.IdentityKind", cfg.Security.IdentityKind, "login_role"},
 		{"Security.ReadOnly", cfg.Security.ReadOnly, true},
 		{"Auth.APIKeyHeader", cfg.Auth.APIKeyHeader, "X-Key"},
+		{"Roles.BaseDSN", cfg.Roles.BaseDSN, "host=roles dbname=pathql"},
+		{"Roles.PasswordSecret", cfg.Roles.PasswordSecret, "decode-secret"},
+		{"Roles.Prefix", cfg.Roles.Prefix, "myr_"},
 		{"Limits.MaxQueryMs", cfg.Limits.MaxQueryMs, 1000},
 		{"Limits.MaxBodyBytes", cfg.Limits.MaxBodyBytes, int64(2048)},
 		{"Limits.MaxResponseBytes", cfg.Limits.MaxResponseBytes, int64(42)},
@@ -113,11 +138,11 @@ func TestLoad_Defaults(t *testing.T) {
 		want interface{}
 	}{
 		{"Listen", cfg.Listen, ":8000"},
+		{"Security.IdentityKind", cfg.Security.IdentityKind, "none"},
 		{"Database.MaxOpenConns", cfg.Database.MaxOpenConns, 50},
 		{"Database.MaxIdleConns", cfg.Database.MaxIdleConns, 10},
 		{"Database.ConnMaxLifetimeMs", cfg.Database.ConnMaxLifetimeMs, 300000},
 		{"Security.AuthTablePrefix", cfg.Security.AuthTablePrefix, "pathql_auth_"},
-		{"Security.SessionVariable", cfg.Security.SessionVariable, "app.user"},
 		{"Auth.APIKeyHeader", cfg.Auth.APIKeyHeader, "X-API-Key"},
 		{"Limits.MaxQueryMs", cfg.Limits.MaxQueryMs, 5000},
 		{"Limits.MaxBodyBytes", cfg.Limits.MaxBodyBytes, int64(1048576)},
@@ -132,59 +157,55 @@ func TestLoad_Defaults(t *testing.T) {
 		}
 	}
 
-	// Zero-valued bools and empty slices stay as-is (no spurious defaults).
+	// Zero-valued bools stay as-is (no spurious defaults).
 	if cfg.Verbose {
 		t.Errorf("Verbose = true, want false")
 	}
 	if cfg.Security.ReadOnly {
 		t.Errorf("Security.ReadOnly = true, want false")
 	}
-	if len(cfg.Auth.Methods) != 0 {
-		t.Errorf("Auth.Methods = %v, want empty", cfg.Auth.Methods)
+}
+
+func TestLoad_NoneModeRequiresDSN(t *testing.T) {
+	// identity_kind defaults to "none", which needs a dsn.
+	_, err := Load(writeTemp(t, `driver = "postgres"`))
+	if err == nil || !strings.Contains(err.Error(), "dsn") {
+		t.Fatalf("got %v, want error mentioning dsn", err)
 	}
 }
 
 func TestLoad_LoginRoleValidation(t *testing.T) {
-	valid := `
-driver = "postgres"
-
-[security]
-identity_kind = "login_role"
-
-[auth]
-methods = ["apikey"]
-
-[roles]
-base_dsn = "host=localhost dbname=pathql sslmode=disable"
-`
-	cfg, err := Load(writeTemp(t, valid))
+	cfg, err := Load(writeTemp(t, minimalLoginRole))
 	if err != nil {
 		t.Fatalf("valid login_role config errored: %v", err)
 	}
 	if cfg.Security.IdentityKind != "login_role" {
 		t.Errorf("IdentityKind = %q, want login_role", cfg.Security.IdentityKind)
 	}
+	if cfg.Roles.BaseDSN == "" || cfg.Roles.PasswordSecret == "" {
+		t.Errorf("roles not decoded: %+v", cfg.Roles)
+	}
 
 	cases := []struct{ name, content, wantMsg string }{
 		{
-			name:    "login_role missing base_dsn",
-			content: "driver=\"postgres\"\n[security]\nidentity_kind=\"login_role\"\n[auth]\nmethods=[\"apikey\"]\n",
+			name:    "missing base_dsn",
+			content: "driver=\"postgres\"\n[security]\nidentity_kind=\"login_role\"\n[auth]\nmethods=[\"apikey\"]\n[roles]\npassword_secret=\"x\"\n",
 			wantMsg: "base_dsn",
 		},
 		{
-			name:    "login_role without auth methods",
-			content: "driver=\"postgres\"\n[security]\nidentity_kind=\"login_role\"\n[roles]\nbase_dsn=\"host=localhost dbname=pathql\"\n",
+			name:    "without auth methods",
+			content: "driver=\"postgres\"\n[security]\nidentity_kind=\"login_role\"\n[roles]\nbase_dsn=\"host=localhost dbname=pathql\"\npassword_secret=\"x\"\n",
 			wantMsg: "auth method",
 		},
 		{
-			name:    "login_role password auth without secret",
-			content: "driver=\"postgres\"\n[security]\nidentity_kind=\"login_role\"\n[auth]\nmethods=[\"apikey\"]\n[roles]\nbase_dsn=\"host=localhost dbname=pathql\"\nauth=\"password\"\n",
+			name:    "without password_secret",
+			content: "driver=\"postgres\"\n[security]\nidentity_kind=\"login_role\"\n[auth]\nmethods=[\"apikey\"]\n[roles]\nbase_dsn=\"host=localhost dbname=pathql\"\n",
 			wantMsg: "password_secret",
 		},
 		{
-			name:    "login_role bad roles auth",
-			content: "driver=\"postgres\"\n[security]\nidentity_kind=\"login_role\"\n[auth]\nmethods=[\"apikey\"]\n[roles]\nbase_dsn=\"host=localhost dbname=pathql\"\nauth=\"bogus\"\n",
-			wantMsg: "roles.auth",
+			name:    "bad roles prefix",
+			content: "driver=\"postgres\"\n[security]\nidentity_kind=\"login_role\"\n[auth]\nmethods=[\"apikey\"]\n[roles]\nbase_dsn=\"host=localhost dbname=pathql\"\npassword_secret=\"x\"\nprefix=\"1bad\"\n",
+			wantMsg: "roles.prefix",
 		},
 		{
 			name:    "unknown identity_kind",
@@ -202,7 +223,7 @@ base_dsn = "host=localhost dbname=pathql sslmode=disable"
 	}
 }
 
-func TestLoad_EnvExpansion(t *testing.T) {
+func TestLoad_DSNEnvExpansion(t *testing.T) {
 	t.Setenv("PATHQL_DB_PASSWORD", "s3cr3t")
 	content := `
 driver = "postgres"
@@ -213,23 +234,6 @@ dsn    = "host=localhost user=app password=${PATHQL_DB_PASSWORD} dbname=pathql"
 		t.Fatalf("Load returned error: %v", err)
 	}
 	want := "host=localhost user=app password=s3cr3t dbname=pathql"
-	if cfg.DSN != want {
-		t.Errorf("DSN = %q, want %q", cfg.DSN, want)
-	}
-}
-
-func TestLoad_EnvExpansion_UnsetBecomesEmpty(t *testing.T) {
-	// Ensure the var is not set in the environment.
-	os.Unsetenv("PATHQL_MISSING_VAR")
-	content := `
-driver = "postgres"
-dsn    = "host=localhost password=${PATHQL_MISSING_VAR} dbname=pathql"
-`
-	cfg, err := Load(writeTemp(t, content))
-	if err != nil {
-		t.Fatalf("Load returned error: %v", err)
-	}
-	want := "host=localhost password= dbname=pathql"
 	if cfg.DSN != want {
 		t.Errorf("DSN = %q, want %q", cfg.DSN, want)
 	}
@@ -251,22 +255,7 @@ dsn    = "host=fromfile dbname=pathql"
 	}
 }
 
-func TestLoad_PathqlDSNOverride_UsedVerbatim(t *testing.T) {
-	// The override is used verbatim: no ${ENV} expansion is applied to it.
-	t.Setenv("SHOULD_NOT_EXPAND", "EXPANDED")
-	t.Setenv("PATHQL_DSN", "host=x password=${SHOULD_NOT_EXPAND}")
-	cfg, err := Load(writeTemp(t, minimalValid))
-	if err != nil {
-		t.Fatalf("Load returned error: %v", err)
-	}
-	want := "host=x password=${SHOULD_NOT_EXPAND}"
-	if cfg.DSN != want {
-		t.Errorf("DSN = %q, want %q (override must be verbatim)", cfg.DSN, want)
-	}
-}
-
 func TestLoad_PathqlDSNOverride_EmptyIgnored(t *testing.T) {
-	// An empty PATHQL_DSN must NOT override the file value.
 	t.Setenv("PATHQL_DSN", "")
 	cfg, err := Load(writeTemp(t, minimalValid))
 	if err != nil {
@@ -274,6 +263,51 @@ func TestLoad_PathqlDSNOverride_EmptyIgnored(t *testing.T) {
 	}
 	if cfg.DSN != "host=localhost dbname=pathql" {
 		t.Errorf("DSN = %q, want file value (empty override ignored)", cfg.DSN)
+	}
+}
+
+func TestLoad_RolesEnvExpansion(t *testing.T) {
+	t.Setenv("PATHQL_DB_PASSWORD", "s3cr3t")
+	t.Setenv("PATHQL_ROLE_SECRET", "fromenv-role-secret")
+	content := `
+driver = "postgres"
+
+[security]
+identity_kind = "login_role"
+
+[auth]
+methods = ["apikey"]
+
+[roles]
+base_dsn        = "host=localhost user=app password=${PATHQL_DB_PASSWORD} dbname=pathql"
+password_secret = "${PATHQL_ROLE_SECRET}"
+`
+	cfg, err := Load(writeTemp(t, content))
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	wantDSN := "host=localhost user=app password=s3cr3t dbname=pathql"
+	if cfg.Roles.BaseDSN != wantDSN {
+		t.Errorf("Roles.BaseDSN = %q, want %q", cfg.Roles.BaseDSN, wantDSN)
+	}
+	if cfg.Roles.PasswordSecret != "fromenv-role-secret" {
+		t.Errorf("Roles.PasswordSecret = %q, want %q", cfg.Roles.PasswordSecret, "fromenv-role-secret")
+	}
+}
+
+func TestLoad_EnvExpansion_UnsetBecomesEmpty(t *testing.T) {
+	os.Unsetenv("PATHQL_MISSING_VAR")
+	content := `
+driver = "postgres"
+dsn    = "host=localhost password=${PATHQL_MISSING_VAR} dbname=pathql"
+`
+	cfg, err := Load(writeTemp(t, content))
+	if err != nil {
+		t.Fatalf("Load returned error: %v", err)
+	}
+	want := "host=localhost password= dbname=pathql"
+	if cfg.DSN != want {
+		t.Errorf("DSN = %q, want %q", cfg.DSN, want)
 	}
 }
 
@@ -300,21 +334,8 @@ func TestLoad_ValidationErrors(t *testing.T) {
 	}{
 		{
 			name:    "empty driver",
-			content: `dsn = "host=localhost dbname=pathql"`,
+			content: `listen = ":9000"`,
 			wantMsg: "driver",
-		},
-		{
-			name:    "empty dsn",
-			content: `driver = "postgres"`,
-			wantMsg: "dsn",
-		},
-		{
-			name: "dsn empty after env expansion",
-			content: `
-driver = "postgres"
-dsn    = "${PATHQL_TOTALLY_UNSET_VAR}"
-`,
-			wantMsg: "dsn",
 		},
 		{
 			name: "unknown method",
@@ -342,7 +363,6 @@ methods = ["apikey", "jwt"]
 			name: "auth_table_prefix starts with digit",
 			content: `
 driver = "postgres"
-dsn    = "host=localhost dbname=pathql"
 
 [security]
 auth_table_prefix = "1bad"
@@ -353,7 +373,6 @@ auth_table_prefix = "1bad"
 			name: "auth_table_prefix has invalid char",
 			content: `
 driver = "postgres"
-dsn    = "host=localhost dbname=pathql"
 
 [security]
 auth_table_prefix = "bad-prefix"
@@ -364,7 +383,6 @@ auth_table_prefix = "bad-prefix"
 			name: "auth_table_prefix with injection chars",
 			content: `
 driver = "postgres"
-dsn    = "host=localhost dbname=pathql"
 
 [security]
 auth_table_prefix = "x\"; DROP TABLE"
@@ -392,8 +410,8 @@ driver = "postgres"
 dsn    = "host=localhost dbname=pathql"
 
 [auth]
-methods        = ["jwt"]
-jwt_algorithms = ["HS256"]
+methods          = ["jwt"]
+jwt_algorithms   = ["HS256"]
 jwt_hs256_secret = "topsecret"
 `
 	cfg, err := Load(writeTemp(t, content))
@@ -553,7 +571,6 @@ methods = ["apikey", "basic"]
 }
 
 func TestLoad_DefaultAuthTablePrefixIsValid(t *testing.T) {
-	// The applied default prefix must itself pass the regex validation.
 	cfg, err := Load(writeTemp(t, minimalValid))
 	if err != nil {
 		t.Fatalf("Load returned error: %v", err)
@@ -578,17 +595,14 @@ func TestLoad_NewDefaults(t *testing.T) {
 		{"Limits.MaxConcurrentGlobal", cfg.Limits.MaxConcurrentGlobal, 200},
 		{"Limits.MaxRequestsPerMinIP", cfg.Limits.MaxRequestsPerMinIP, 120},
 		{"Limits.MaxAuthFailuresPerMin", cfg.Limits.MaxAuthFailuresPerMin, 60},
-		{"Security.BlockMultipleStatements", cfg.Security.BlockMultipleStatements, true},
 		{"Security.MetricsUser", cfg.Security.MetricsUser, "metrics"},
 		{"Security.StartupChecks", cfg.Security.StartupChecks, "warn"},
-		{"Security.IdentityKind", cfg.Security.IdentityKind, "session_guc"},
 		{"Database.ConnMaxIdleTimeMs", cfg.Database.ConnMaxIdleTimeMs, 60000},
 		{"Database.MaxTotalBackends", cfg.Database.MaxTotalBackends, 200},
 		{"Roles.BaselineRole", cfg.Roles.BaselineRole, "pathql_auth"},
 		{"Roles.Prefix", cfg.Roles.Prefix, "pathql_r_"},
 		{"Roles.ReaderRole", cfg.Roles.ReaderRole, "pathql_readers"},
 		{"Roles.WarmPoolLimit", cfg.Roles.WarmPoolLimit, 64},
-		{"Cache.Backend", cfg.Cache.Backend, "embedded"},
 		{"Cache.MemoryMB", cfg.Cache.MemoryMB, 64},
 		{"Cache.AuthTTL", cfg.Cache.AuthTTL, "30s"},
 		{"Cache.JWKSTTL", cfg.Cache.JWKSTTL, "1h"},
@@ -613,17 +627,12 @@ func TestLoad_NewExplicitValues(t *testing.T) {
 driver = "postgres"
 dsn    = "host=localhost dbname=pathql"
 
-[security]
-block_multiple_statements = false
-
 [limits]
 max_concurrent_per_user = 3
 max_concurrent_global   = 50
 max_requests_per_min_ip = 7
 
 [cache]
-backend   = "embedded"
-address   = "127.0.0.1:11211"
 memory_mb = 128
 auth_ttl  = "45s"
 jwks_ttl  = "2h30m"
@@ -648,12 +657,9 @@ allowed_origins = ["https://a.example", "https://b.example"]
 		got  interface{}
 		want interface{}
 	}{
-		{"Security.BlockMultipleStatements", cfg.Security.BlockMultipleStatements, false},
 		{"Limits.MaxConcurrentPerUser", cfg.Limits.MaxConcurrentPerUser, 3},
 		{"Limits.MaxConcurrentGlobal", cfg.Limits.MaxConcurrentGlobal, 50},
 		{"Limits.MaxRequestsPerMinIP", cfg.Limits.MaxRequestsPerMinIP, 7},
-		{"Cache.Backend", cfg.Cache.Backend, "embedded"},
-		{"Cache.Address", cfg.Cache.Address, "127.0.0.1:11211"},
 		{"Cache.MemoryMB", cfg.Cache.MemoryMB, 128},
 		{"Cache.AuthTTL", cfg.Cache.AuthTTL, "45s"},
 		{"Cache.JWKSTTL", cfg.Cache.JWKSTTL, "2h30m"},
@@ -675,43 +681,6 @@ allowed_origins = ["https://a.example", "https://b.example"]
 		cfg.CORS.AllowedOrigins[0] != "https://a.example" ||
 		cfg.CORS.AllowedOrigins[1] != "https://b.example" {
 		t.Errorf("CORS.AllowedOrigins = %v, want [https://a.example https://b.example]", cfg.CORS.AllowedOrigins)
-	}
-}
-
-func TestLoad_CacheBackendValidation(t *testing.T) {
-	tests := []struct {
-		name    string
-		backend string
-		wantErr bool
-	}{
-		{"empty defaults to embedded", "", false},
-		{"embedded ok", "embedded", false},
-		{"memcached rejected", "memcached", true},
-		{"unknown rejected", "redis", true},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			content := minimalValid
-			if tc.backend != "" {
-				content += "\n[cache]\nbackend = \"" + tc.backend + "\"\n"
-			}
-			cfg, err := Load(writeTemp(t, content))
-			if tc.wantErr {
-				if err == nil {
-					t.Fatalf("Load returned nil error, want error for backend %q", tc.backend)
-				}
-				if !strings.Contains(err.Error(), "cache backend") {
-					t.Errorf("error = %q, want substring %q", err.Error(), "cache backend")
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("Load returned error for backend %q: %v", tc.backend, err)
-			}
-			if cfg.Cache.Backend != "embedded" {
-				t.Errorf("Cache.Backend = %q, want embedded", cfg.Cache.Backend)
-			}
-		})
 	}
 }
 
@@ -758,17 +727,20 @@ jwks_ttl = "5 zonks"
 }
 
 func TestLoad_TLSValidation(t *testing.T) {
+	// A valid none-mode preamble so the content reaches the (last) TLS check
+	// rather than failing earlier on the dsn requirement.
+	const preamble = `
+driver = "postgres"
+dsn    = "host=localhost dbname=pathql"
+`
 	tests := []struct {
 		name    string
-		content string
+		tls     string
 		wantErr bool
 	}{
 		{
 			name: "enabled without cert/key",
-			content: `
-driver = "postgres"
-dsn    = "host=localhost dbname=pathql"
-
+			tls: `
 [tls]
 enabled = true
 `,
@@ -776,10 +748,7 @@ enabled = true
 		},
 		{
 			name: "enabled with cert only",
-			content: `
-driver = "postgres"
-dsn    = "host=localhost dbname=pathql"
-
+			tls: `
 [tls]
 enabled   = true
 cert_file = "/etc/pathql/tls.crt"
@@ -788,10 +757,7 @@ cert_file = "/etc/pathql/tls.crt"
 		},
 		{
 			name: "enabled with cert and key",
-			content: `
-driver = "postgres"
-dsn    = "host=localhost dbname=pathql"
-
+			tls: `
 [tls]
 enabled   = true
 cert_file = "/etc/pathql/tls.crt"
@@ -801,10 +767,7 @@ key_file  = "/etc/pathql/tls.key"
 		},
 		{
 			name: "disabled without cert/key ok",
-			content: `
-driver = "postgres"
-dsn    = "host=localhost dbname=pathql"
-
+			tls: `
 [tls]
 enabled = false
 `,
@@ -813,7 +776,7 @@ enabled = false
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := Load(writeTemp(t, tc.content))
+			_, err := Load(writeTemp(t, preamble+tc.tls))
 			if tc.wantErr {
 				if err == nil {
 					t.Fatal("Load returned nil error, want TLS validation error")
@@ -825,6 +788,59 @@ enabled = false
 			}
 			if err != nil {
 				t.Fatalf("Load returned error: %v", err)
+			}
+		})
+	}
+}
+
+func TestWeakRoleSecretFinding(t *testing.T) {
+	withSecret := func(secret string) *Config {
+		c := &Config{}
+		c.Roles.PasswordSecret = secret
+		return c
+	}
+
+	cases := []struct {
+		name     string
+		cfg      *Config
+		wantWeak bool
+		wantSub  string
+	}{
+		{
+			name:     "demo placeholder secret",
+			cfg:      withSecret("login-role-demo-secret"),
+			wantWeak: true,
+			wantSub:  "placeholder",
+		},
+		{
+			name:     "placeholder is matched case-insensitively",
+			cfg:      withSecret("ChangeMe"),
+			wantWeak: true,
+			wantSub:  "placeholder",
+		},
+		{
+			name:     "short secret is low-entropy",
+			cfg:      withSecret("short"),
+			wantWeak: true,
+			wantSub:  "characters",
+		},
+		{
+			name:     "long random secret passes",
+			cfg:      withSecret("Hh7Qe2pVx9Lr3KmZ8Nb1Tc4Wd6Yf0Sg"),
+			wantWeak: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			finding, weak := tc.cfg.WeakRoleSecretFinding()
+			if weak != tc.wantWeak {
+				t.Fatalf("weak = %v, want %v (finding %q)", weak, tc.wantWeak, finding)
+			}
+			if weak && !strings.Contains(finding, tc.wantSub) {
+				t.Errorf("finding = %q, want substring %q", finding, tc.wantSub)
+			}
+			if !weak && finding != "" {
+				t.Errorf("finding = %q, want empty when not weak", finding)
 			}
 		})
 	}

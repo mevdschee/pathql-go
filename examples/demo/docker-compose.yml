@@ -1,50 +1,45 @@
 name: pathql-demo
 
-# A self-contained demo: PostgreSQL seeded with auth + sample data, and the
-# pathql-server built from this repo. Run it with:
+# A one-command demo of the simple, single-connection model: the server connects
+# as one shared role (pathql_app) and there is no row-level security. Run it with:
 #
 #   cd examples/demo
 #   docker compose up --build
 #
-# Then try the curl commands in README.md. Tear down (including the database
+# Then follow the walkthrough in README.md. Tear down (including the database
 # volume) with: docker compose down -v
 
 services:
   db:
     image: postgres:16
     environment:
-      POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: pathql
     # initdb scripts run once, in filename order, on first boot only.
     volumes:
       - ./initdb:/docker-entrypoint-initdb.d:ro
     # Published on 5433 to avoid colliding with a Postgres already on the host's
-    # 5432. The server reaches the database over the compose network, not this
-    # port; it only lets you psql in from the host:
-    #   psql -h localhost -p 5433 -U postgres pathql   (password: postgres)
+    # 5432 (and with the sibling login-role demo on 5434). The server reaches the
+    # database over the compose network, not this port; it only lets you psql in
+    # from the host:
+    #   psql -h localhost -p 5433 -U postgres pathql
     ports:
       - "5433:5432"
     healthcheck:
-      # Force a TCP check so it only reports healthy after the real startup,
-      # not during the socket-only initdb phase. The server waits for this.
-      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U postgres -d pathql"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d pathql"]
       interval: 2s
       timeout: 3s
       retries: 30
 
   server:
+    # Build context is the repo root so the whole module is available.
     build:
       context: ../..
       dockerfile: examples/demo/Dockerfile
     depends_on:
       db:
         condition: service_healthy
-    environment:
-      # Referenced as ${PATHQL_DB_PASSWORD} in config.ini. Must match the
-      # password given to the pathql_app role in initdb/01-schema.sql.
-      PATHQL_DB_PASSWORD: pathql_demo_pw
     volumes:
       - ./config.ini:/app/config.ini:ro
     ports:
-      - "8000:8000"   # POST /pathql and GET /metrics (metrics gated to the metrics user)
+      - "8000:8000"   # POST /pathql, GET /metrics

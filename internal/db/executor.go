@@ -3,8 +3,6 @@ package db
 import (
 	"context"
 	"database/sql"
-	"fmt"
-	"regexp"
 	"strconv"
 	"time"
 
@@ -13,16 +11,10 @@ import (
 )
 
 // QueryOptions configures how RunQuery executes a query under Postgres
-// row-level security: which session variable to bind the application user to,
-// whether to use a read-only transaction, and an optional statement timeout.
+// row-level security: whether to use a read-only transaction, and the optional
+// transaction-local resource limits. The caller's identity is the connected
+// database role (current_user), so there is no session variable to bind.
 type QueryOptions struct {
-	// AppUser is the value bound to SessionVariable for this transaction.
-	// When empty, no session variable is set.
-	AppUser string
-	// SessionVariable is the custom Postgres GUC name (e.g. "app.user"). It
-	// must be schema-qualified (contain a dot). When empty, no session
-	// variable is set.
-	SessionVariable string
 	// ReadOnly opens the transaction READ ONLY when true.
 	ReadOnly bool
 	// StatementTimeout, when > 0, sets a transaction-local statement_timeout.
@@ -36,45 +28,11 @@ type QueryOptions struct {
 	WorkMemKB int
 }
 
-// sessionVariablePattern matches a valid custom Postgres GUC name. The name
-// must start with a letter or underscore and may contain letters, digits,
-// underscores and dots. A separate check requires at least one dot so the
-// variable is schema-qualified (a hard requirement for custom GUCs).
-var sessionVariablePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.]*$`)
-
-// validateSessionVariable returns an error unless name is a syntactically
-// valid, schema-qualified custom Postgres GUC name. It is the single source of
-// truth for what RunQuery is willing to set, and is unit-tested directly.
-func validateSessionVariable(name string) error {
-	if !sessionVariablePattern.MatchString(name) {
-		return fmt.Errorf("invalid session variable name %q", name)
-	}
-	if !regexpHasDot(name) {
-		return fmt.Errorf("session variable %q must be schema-qualified (contain a dot)", name)
-	}
-	return nil
-}
-
-// regexpHasDot reports whether s contains a '.'. Kept tiny and explicit so the
-// schema-qualification requirement is obvious at the call site.
-func regexpHasDot(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if s[i] == '.' {
-			return true
-		}
-	}
-	return false
-}
-
-// applySessionSettings applies the transaction-local session settings from
-// opts to tx using the function form of SET LOCAL (set_config(..., true)),
-// which, unlike a bare SET, accepts bound parameters. This keeps the
-// application user and the session-variable name as bound arguments instead of
-// concatenating them into SQL.
-//
-// Order: statement_timeout first (if any), then the session variable (if any).
-// It is factored out of RunQuery so it can be unit-tested against a recording
-// fake driver without a real schema.
+// applySessionSettings applies the transaction-local resource limits from opts
+// to tx using the function form of SET LOCAL (set_config(..., true)), which,
+// unlike a bare SET, accepts bound parameters. It is factored out of RunQuery
+// so it can be unit-tested against a recording fake driver without a real
+// schema.
 func applySessionSettings(ctx context.Context, tx *sqlx.Tx, opts QueryOptions) error {
 	if opts.StatementTimeout > 0 {
 		ms := strconv.FormatInt(int64(opts.StatementTimeout/time.Millisecond), 10)
@@ -92,14 +50,6 @@ func applySessionSettings(ctx context.Context, tx *sqlx.Tx, opts QueryOptions) e
 		// work_mem with no unit is interpreted as kB by PostgreSQL. It is USERSET,
 		// so a least-privilege (non-superuser) role may set it per transaction.
 		if _, err := tx.ExecContext(ctx, "SELECT set_config($1, $2, true)", "work_mem", strconv.Itoa(opts.WorkMemKB)); err != nil {
-			return err
-		}
-	}
-	if opts.AppUser != "" && opts.SessionVariable != "" {
-		if err := validateSessionVariable(opts.SessionVariable); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, "SELECT set_config($1, $2, true)", opts.SessionVariable, opts.AppUser); err != nil {
 			return err
 		}
 	}

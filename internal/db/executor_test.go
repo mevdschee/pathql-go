@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"io"
 	"os"
 	"sync"
@@ -33,6 +34,9 @@ type recorder struct {
 	begins    int
 	commits   int
 	rollbacks int
+	// failErr, when set, is returned by every Exec so a test can force a
+	// session-setting failure and exercise the rollback path.
+	failErr error
 }
 
 func (r *recorder) record(query string, args []driver.Value) {
@@ -103,6 +107,12 @@ func (s recStmt) NumInput() int { return -1 }
 
 func (s recStmt) Exec(args []driver.Value) (driver.Result, error) {
 	s.rec.record(s.query, args)
+	s.rec.mu.Lock()
+	fe := s.rec.failErr
+	s.rec.mu.Unlock()
+	if fe != nil {
+		return nil, fe
+	}
 	return driver.RowsAffected(0), nil
 }
 
@@ -142,6 +152,7 @@ func openRecordingTx(t *testing.T, readOnly bool) (*sqlx.Tx, *recorder, func()) 
 	sharedRecorder.begins = 0
 	sharedRecorder.commits = 0
 	sharedRecorder.rollbacks = 0
+	sharedRecorder.failErr = nil
 	sharedRecorder.mu.Unlock()
 
 	sdb, err := sql.Open(recDriverName, "")
@@ -167,46 +178,40 @@ func TestApplySessionSettings_Full(t *testing.T) {
 	defer cleanup()
 
 	opts := QueryOptions{
-		AppUser:          "alice",
-		SessionVariable:  "app.user",
 		ReadOnly:         true,
 		StatementTimeout: 5 * time.Second,
+		IdleInTxTimeout:  3 * time.Second,
+		WorkMemKB:        2048,
 	}
 	if err := applySessionSettings(context.Background(), tx, opts); err != nil {
 		t.Fatalf("applySessionSettings: %v", err)
 	}
 
 	stmts := rec.snapshot()
-	if len(stmts) != 2 {
-		t.Fatalf("expected 2 statements, got %d: %+v", len(stmts), stmts)
+	if len(stmts) != 3 {
+		t.Fatalf("expected 3 statements, got %d: %+v", len(stmts), stmts)
 	}
 
-	// 1) statement_timeout first.
-	if stmts[0].query != "SELECT set_config($1, $2, true)" {
-		t.Errorf("stmt[0] query = %q", stmts[0].query)
+	// Each limit is set via the bound function form, in a fixed order, with the
+	// GUC name and value both passed as bound arguments (never concatenated).
+	want := []struct{ name, value string }{
+		{"statement_timeout", "5000"},
+		{"idle_in_transaction_session_timeout", "3000"},
+		{"work_mem", "2048"},
 	}
-	if len(stmts[0].args) != 2 {
-		t.Fatalf("stmt[0] args = %+v", stmts[0].args)
-	}
-	if got := stmts[0].args[0]; got != "statement_timeout" {
-		t.Errorf("stmt[0] arg0 = %v, want statement_timeout", got)
-	}
-	if got := stmts[0].args[1]; got != "5000" {
-		t.Errorf("stmt[0] arg1 = %v, want \"5000\" (ms as string)", got)
-	}
-
-	// 2) session variable second, with the var NAME and app user both BOUND.
-	if stmts[1].query != "SELECT set_config($1, $2, true)" {
-		t.Errorf("stmt[1] query = %q", stmts[1].query)
-	}
-	if len(stmts[1].args) != 2 {
-		t.Fatalf("stmt[1] args = %+v", stmts[1].args)
-	}
-	if got := stmts[1].args[0]; got != "app.user" {
-		t.Errorf("stmt[1] arg0 = %v, want app.user (bound)", got)
-	}
-	if got := stmts[1].args[1]; got != "alice" {
-		t.Errorf("stmt[1] arg1 = %v, want alice (bound)", got)
+	for i, w := range want {
+		if stmts[i].query != "SELECT set_config($1, $2, true)" {
+			t.Errorf("stmt[%d] query = %q", i, stmts[i].query)
+		}
+		if len(stmts[i].args) != 2 {
+			t.Fatalf("stmt[%d] args = %+v", i, stmts[i].args)
+		}
+		if got := stmts[i].args[0]; got != w.name {
+			t.Errorf("stmt[%d] arg0 = %v, want %s", i, got, w.name)
+		}
+		if got := stmts[i].args[1]; got != w.value {
+			t.Errorf("stmt[%d] arg1 = %v, want %q", i, got, w.value)
+		}
 	}
 }
 
@@ -227,32 +232,13 @@ func TestApplySessionSettings_TimeoutOnly(t *testing.T) {
 	}
 }
 
-func TestApplySessionSettings_SessionVarOnly(t *testing.T) {
-	tx, rec, cleanup := openRecordingTx(t, true)
-	defer cleanup()
-
-	opts := QueryOptions{AppUser: "bob", SessionVariable: "pathql.user"}
-	if err := applySessionSettings(context.Background(), tx, opts); err != nil {
-		t.Fatalf("applySessionSettings: %v", err)
-	}
-	stmts := rec.snapshot()
-	if len(stmts) != 1 {
-		t.Fatalf("expected 1 statement, got %d: %+v", len(stmts), stmts)
-	}
-	if stmts[0].args[0] != "pathql.user" || stmts[0].args[1] != "bob" {
-		t.Errorf("session var stmt args = %+v, want [pathql.user bob]", stmts[0].args)
-	}
-}
-
 func TestApplySessionSettings_NoneWhenEmpty(t *testing.T) {
 	tx, rec, cleanup := openRecordingTx(t, false)
 	defer cleanup()
 
 	cases := []QueryOptions{
-		{},                            // all zero
-		{AppUser: "x"},                // no session variable
-		{SessionVariable: "app.user"}, // no app user
-		{StatementTimeout: 0, AppUser: "x", SessionVariable: ""}, // empty var
+		{},               // all zero: no limits to apply
+		{ReadOnly: true}, // read-only affects the tx, not the session settings
 	}
 	for i, opts := range cases {
 		// reset recorder between sub-cases
@@ -268,58 +254,10 @@ func TestApplySessionSettings_NoneWhenEmpty(t *testing.T) {
 	}
 }
 
-func TestApplySessionSettings_InvalidSessionVar(t *testing.T) {
-	tx, rec, cleanup := openRecordingTx(t, false)
-	defer cleanup()
-
-	// A bad session-variable name with an app user set must be a hard error and
-	// must NOT emit any session-variable statement (fail closed).
-	opts := QueryOptions{AppUser: "alice", SessionVariable: "app.user;DROP TABLE"}
-	if err := applySessionSettings(context.Background(), tx, opts); err == nil {
-		t.Fatal("expected error for invalid session variable, got nil")
-	}
-	// No set_config for the session var should have been issued.
-	for _, s := range rec.snapshot() {
-		for _, a := range s.args {
-			if a == "alice" {
-				t.Errorf("app user was issued despite invalid session var: %+v", s)
-			}
-		}
-	}
-}
-
-// --- session-variable validation -------------------------------------------
-
-func TestValidateSessionVariable(t *testing.T) {
-	valid := []string{"app.user", "pathql.user", "my_app.current_user", "_x.y", "a.b.c"}
-	for _, v := range valid {
-		if err := validateSessionVariable(v); err != nil {
-			t.Errorf("validateSessionVariable(%q) = %v, want nil", v, err)
-		}
-	}
-	invalid := []string{
-		"app_user",       // no dot
-		"appuser",        // no dot
-		"app.user;DROP",  // bad char ;
-		"app.user'",      // bad char '
-		"app.user space", // space
-		"1app.user",      // leading digit
-		".user",          // leading dot (no valid first char)
-		"",               // empty
-		"app.us er",      // embedded space
-		"app-user.x",     // hyphen
-	}
-	for _, v := range invalid {
-		if err := validateSessionVariable(v); err == nil {
-			t.Errorf("validateSessionVariable(%q) = nil, want error", v)
-		}
-	}
-}
-
 // --- RunQuery transaction lifecycle (no real schema) -----------------------
 //
 // RunQuery ultimately calls PathQueryTx which needs a real schema, so we only
-// exercise the begin/settings/rollback path here by forcing the validation to
+// exercise the begin/settings/rollback path here by forcing a session setting to
 // fail, which must roll back the transaction without committing.
 
 func TestRunQuery_RollsBackOnSettingsError(t *testing.T) {
@@ -328,7 +266,13 @@ func TestRunQuery_RollsBackOnSettingsError(t *testing.T) {
 	sharedRecorder.begins = 0
 	sharedRecorder.commits = 0
 	sharedRecorder.rollbacks = 0
+	sharedRecorder.failErr = errors.New("set_config failed")
 	sharedRecorder.mu.Unlock()
+	t.Cleanup(func() {
+		sharedRecorder.mu.Lock()
+		sharedRecorder.failErr = nil
+		sharedRecorder.mu.Unlock()
+	})
 
 	sdb, err := sql.Open(recDriverName, "")
 	if err != nil {
@@ -337,10 +281,12 @@ func TestRunQuery_RollsBackOnSettingsError(t *testing.T) {
 	pool := pathsqlx.NewDb(sdb, recDriverName)
 	t.Cleanup(func() { _ = pool.DB.DB.Close() })
 
-	opts := QueryOptions{AppUser: "alice", SessionVariable: "no_dot_here"}
+	// A statement timeout makes applySessionSettings issue a set_config, which the
+	// fake driver fails, so RunQuery must roll back without committing.
+	opts := QueryOptions{StatementTimeout: time.Second}
 	_, err = RunQuery(context.Background(), pool, "SELECT 1", nil, nil, opts)
 	if err == nil {
-		t.Fatal("expected error from invalid session variable, got nil")
+		t.Fatal("expected error from failing session setting, got nil")
 	}
 	sharedRecorder.mu.Lock()
 	defer sharedRecorder.mu.Unlock()
@@ -377,13 +323,11 @@ func TestRunQuery_LivePostgres(t *testing.T) {
 	}
 
 	opts := QueryOptions{
-		AppUser:          "live-tester",
-		SessionVariable:  "pathql.user",
 		ReadOnly:         true,
 		StatementTimeout: 5 * time.Second,
 	}
 	res, err := RunQuery(ctx, pool,
-		`SELECT current_setting('pathql.user', true) AS "$.user"`, nil, nil, opts)
+		`SELECT current_user AS "$.user"`, nil, nil, opts)
 	if err != nil {
 		t.Fatalf("RunQuery: %v", err)
 	}

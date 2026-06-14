@@ -30,13 +30,16 @@ import (
 // cfg holds the loaded server configuration.
 var cfg *config.Config
 
-// pool is the shared connection pool. In session_guc mode it serves every query;
-// in login_role mode it is the baseline connection (authenticated as
-// roles.baseline_role) used for auth-table lookups and catalog reads.
+// pool is the shared connection pool. With identity_kind "none" it serves every
+// caller query (the simple, no-RLS model). With identity_kind "login_role" it is
+// the baseline connection (authenticated as roles.baseline_role) used for
+// auth-table lookups, admin CRUD and catalog reads, and caller queries run on
+// rolePools instead.
 var pool *pathsqlx.DB
 
-// rolePools is the per-role connection manager, non-nil only in login_role mode.
-// Each query runs on a connection authenticated as the caller's own role.
+// rolePools is the per-role connection manager, non-nil only with identity_kind
+// "login_role". Each caller query then runs on a connection authenticated as the
+// caller's own database role.
 var rolePools *db.RolePools
 
 // sharedCache is the abuse-protection / JWKS cache built at startup and shared
@@ -430,17 +433,19 @@ func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
 	ctx, cancel := context.WithTimeout(req.Context(), statementTimeout)
 	defer cancel()
 
-	// Select the connection and identity binding by identity model.
-	queryPool := pool
 	opts := db.QueryOptions{
 		ReadOnly:         cfg.Security.ReadOnly,
 		StatementTimeout: statementTimeout,
 		IdleInTxTimeout:  statementTimeout,
 		WorkMemKB:        cfg.Limits.WorkMemKB,
 	}
+
+	// Select the connection by identity model. With identity_kind "none" the
+	// shared pool serves every query and there is no per-caller RLS binding. With
+	// "login_role" the query runs on a connection authenticated as the caller's
+	// own database role, so RLS policies see an unforgeable current_user.
+	queryPool := pool
 	if cfg.Security.IdentityKind == "login_role" {
-		// Identity is current_user: run on a connection authenticated as the
-		// caller's own database role, with no app.user binding.
 		if principal == nil {
 			writeError(w, req, http.StatusUnauthorized, "authentication required", nil)
 			return
@@ -461,10 +466,6 @@ func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
 		}
 		defer release()
 		queryPool = rp
-	} else {
-		// session_guc: bind app.user via set_config; policies read current_setting.
-		opts.AppUser = appUser
-		opts.SessionVariable = cfg.Security.SessionVariable
 	}
 
 	response, err := db.RunQuery(ctx, queryPool, request.Query, params, paths, opts)
@@ -680,17 +681,14 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Open the database pools. In session_guc mode a single shared pool serves
-	// every request. In login_role mode `pool` is the baseline connection
-	// (authenticated as roles.baseline_role) for auth lookups and catalog reads,
-	// and rolePools serves queries on per-role connections.
+	// Open the database connections. With identity_kind "none" a single shared
+	// pool (the top-level dsn) serves every request and there is no RLS isolation.
+	// With "login_role", rolePools serves caller queries on per-role connections
+	// and `pool` is the baseline connection (authenticated as roles.baseline_role)
+	// used for auth lookups, admin CRUD and catalog reads.
 	baseDSN := cfg.DSN
 	if cfg.Security.IdentityKind == "login_role" {
-		pw := rolePasswordFunc() // nil in trust mode
-		baseDSN = cfg.Roles.BaseDSN + " user=" + cfg.Roles.BaselineRole
-		if pw != nil {
-			baseDSN += " password=" + pw(cfg.Roles.BaselineRole)
-		}
+		pw := rolePasswordFunc()
 		defaults := db.PoolParams{
 			MaxOpen:         cfg.Database.MaxOpenConns,
 			MaxIdle:         cfg.Database.MaxIdleConns,
@@ -701,11 +699,13 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		if pw != nil {
-			rolePools.UseRolePassword(pw)
-		}
+		rolePools.UseRolePassword(pw)
 		defer rolePools.Close()
-		log.Printf("identity model: login_role (per-role connections, current_user RLS, auth=%s)", cfg.Roles.Auth)
+		baseDSN = cfg.Roles.BaseDSN + " user=" + cfg.Roles.BaselineRole +
+			" password=" + pw(cfg.Roles.BaselineRole)
+		log.Printf("identity model: login_role (per-role connections, current_user RLS)")
+	} else {
+		log.Printf("identity model: none (single shared connection, no row-level security)")
 	}
 	pool, err = db.OpenPool(
 		cfg.Driver,
@@ -723,16 +723,6 @@ func main() {
 	userAdmin, err = auth.NewUserAdmin(pool.DB, cfg.Security.AuthTablePrefix)
 	if err != nil {
 		log.Fatal(err)
-	}
-
-	// Runtime pool settings persistence, and apply the stored defaults/overrides
-	// to the live pools (login_role mode only).
-	if rolePools != nil {
-		poolStore, err = db.NewPoolStore(pool.DB, cfg.Security.AuthTablePrefix)
-		if err != nil {
-			log.Fatal(err)
-		}
-		loadPoolSettings()
 	}
 
 	// Lazy startup: warn but keep going if the database is unreachable now.
@@ -767,10 +757,6 @@ func main() {
 	router.Handle("POST /admin/users", adminHandler(cfg, chain, sharedCache, trustedProxies, adminAddUser))
 	router.Handle("DELETE /admin/users/{id}", adminHandler(cfg, chain, sharedCache, trustedProxies, adminDeleteUser))
 	router.Handle("GET /admin/roles/sync", adminHandler(cfg, chain, sharedCache, trustedProxies, adminRolesSync))
-	router.Handle("GET /admin/pool", adminHandler(cfg, chain, sharedCache, trustedProxies, adminGetPool))
-	router.Handle("PUT /admin/pool", adminHandler(cfg, chain, sharedCache, trustedProxies, adminPutPool))
-	router.Handle("PUT /admin/users/{id}/pool", adminHandler(cfg, chain, sharedCache, trustedProxies, adminPutUserPool))
-	router.Handle("DELETE /admin/users/{id}/pool", adminHandler(cfg, chain, sharedCache, trustedProxies, adminDeleteUserPool))
 
 	readTimeout := time.Duration(cfg.Timeouts.ReadMs) * time.Millisecond
 	writeTimeout := time.Duration(cfg.Timeouts.WriteMs) * time.Millisecond
@@ -843,32 +829,47 @@ func main() {
 	}
 }
 
-// runStartupChecks runs the database hardening self-check according to
+// runStartupChecks runs the startup hardening self-check according to
 // cfg.Security.StartupChecks: "off" skips it, "warn" logs any findings, and
-// "enforce" additionally aborts startup on a critical finding (superuser role or
-// write privileges). Findings are advisory in warn mode so a developer setup
-// without full hardening still runs.
+// "enforce" additionally aborts startup on a critical finding (superuser role,
+// write privileges, or a weak login_role password secret). It combines a
+// config-only check (the role password secret) with the database catalog check,
+// so the secret check still runs when the database is unreachable. Findings are
+// advisory in warn mode so a developer setup without full hardening still runs.
 func runStartupChecks(c *config.Config, pool *pathsqlx.DB) {
 	if c.Security.StartupChecks == "off" {
 		return
 	}
+	var warnings, critical []string
+
+	// Config-only check: a weak login_role password secret. It needs no database
+	// connection, so it runs even when the catalog check below cannot.
+	if finding, weak := c.WeakRoleSecretFinding(); weak {
+		critical = append(critical, finding)
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	dbChecked := true
 	rep, err := db.VerifyHardening(ctx, pool, c.Driver, c.Security.AuthTablePrefix)
 	if err != nil {
 		log.Printf("WARNING: startup hardening check could not run: %v", err)
-		return
+		dbChecked = false
+	} else {
+		warnings = append(warnings, rep.Warnings...)
+		critical = append(critical, rep.Critical...)
 	}
-	for _, w := range rep.Warnings {
+
+	for _, w := range warnings {
 		log.Printf("WARNING: hardening: %s", w)
 	}
-	for _, cr := range rep.Critical {
+	for _, cr := range critical {
 		log.Printf("CRITICAL: hardening: %s", cr)
 	}
-	if c.Security.StartupChecks == "enforce" && len(rep.Critical) > 0 {
-		log.Fatalf("startup_checks=enforce: %d critical hardening finding(s); aborting startup", len(rep.Critical))
+	if c.Security.StartupChecks == "enforce" && len(critical) > 0 {
+		log.Fatalf("startup_checks=enforce: %d critical hardening finding(s); aborting startup", len(critical))
 	}
-	if rep.Empty() {
+	if dbChecked && len(warnings) == 0 && len(critical) == 0 {
 		log.Printf("hardening: startup checks passed")
 	}
 }

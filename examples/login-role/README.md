@@ -1,36 +1,30 @@
-# pathql-server login_role demo
+# pathql-server demo
 
-A one-command demo of the **login_role** identity model. Each user maps to its
-own PostgreSQL role, the server opens its database connection AS that role, and
-row-level security keys on `current_user`. Because `current_user` is the role
-the connection authenticated as, a query cannot forge it: the identity boundary
-lives in the database, not in anything the request can set.
+A one-command demo of pathql-server. Each user maps to its own PostgreSQL role,
+the server opens its database connection AS that role, and row-level security
+keys on `current_user`. Because `current_user` is the role the connection
+authenticated as, a query cannot forge it: the identity boundary lives in the
+database, not in anything the request can set.
 
-This is a demo, not a hardened deployment: it uses plaintext HTTP on localhost,
-fixed demo credentials, and `trust` database authentication that is only safe
-because the database is reachable solely over the isolated compose network.
+This is a demo, not a hardened deployment: it uses plaintext HTTP on localhost
+and fixed demo credentials. The database connections do use real per-role
+passwords (SCRAM), derived from a `password_secret` that is checked into the
+example for convenience; in production load that secret from the environment.
 
-## How this differs from the session_guc demo
+## How identity reaches RLS
 
-The sibling [`../demo`](../demo/README.md) uses the **session_guc** model: every
-request runs on a shared application role, and the server binds the caller's
-identity into a session variable (`app.user`) that RLS reads. The identity is
-trustworthy because the server sets it, but it is a value the server carries, not
-the connection's own identity.
+The server never runs caller queries on a shared application role. It connects
+as the caller's own per-user role and lets PostgreSQL enforce identity:
 
-The login_role model moves that boundary into PostgreSQL itself:
+- connects as the caller's own per-user role (`pathql_r_<id>`)
+- RLS keys on `current_user`, the role the connection authenticated as
+- a query cannot change `current_user`, so identity cannot be forged in SQL
+- per-user roles are created out of band from the DDL the server emits at
+  `GET /admin/roles/sync`; the server itself never holds CREATEROLE
 
-| | session_guc demo | login_role demo (this one) |
-|---|---|---|
-| connects as | one shared app role | the caller's own per-user role |
-| RLS keys on | `current_setting('app.user')` | `current_user` |
-| identity is | a session GUC the server sets | the connected role, set at authentication |
-| forgeable in SQL? | no (server resets it) | no (a query cannot change `current_user`) |
-| per-user roles | none | created out of band from emitted DDL |
-
-A nice property of login_role: even a single statement that tries to change the
-role is rejected by the database, so identity holds without the server having to
-defend a session variable.
+A nice property: even a single statement that tries to change the role is
+rejected by the database, so identity holds without the server having to defend
+a session variable.
 
 ## Prerequisites
 
@@ -106,8 +100,8 @@ curl -s localhost:8000/admin/roles/sync -H 'X-API-Key: adminkey_0001'
 ```
 
 The response lists the `ddl` lines: a `CREATE ROLE ... LOGIN NOSUPERUSER
-NOCREATEROLE` and a `GRANT pathql_readers` for each of alice and bob. Apply them
-as the superuser:
+NOCREATEROLE ... PASSWORD '...'` (the derived per-role password) and a `GRANT
+pathql_readers` for each of alice and bob. Apply them as the superuser:
 
 ```sh
 curl -s localhost:8000/admin/roles/sync -H 'X-API-Key: adminkey_0001' \
@@ -231,17 +225,18 @@ gone, so there is nothing to authenticate.
 3. An operator or cron job applies that DDL as a privileged role. This is the
    only place role DDL ever runs.
 4. On each request the server resolves the caller, opens (or reuses) a connection
-   that authenticates as that caller's role via `trust` over the compose network,
-   and runs the query. RLS filters by `current_user`.
+   that authenticates as that caller's role with the role's derived password, and
+   runs the query. RLS filters by `current_user`.
 
 ## Security notes
 
-- **trust auth is only safe on an isolated network.** This demo sets
-  `POSTGRES_HOST_AUTH_METHOD=trust` so the server can connect as any managed role
-  with no password. That is acceptable only because the database is reachable
-  solely over the private compose network. In production use client certificates
-  with a `pg_ident` map, or peer auth on a local socket, never trust on a network
-  anyone untrusted can reach.
+- **Each role authenticates with a password (SCRAM).** This demo sets
+  `POSTGRES_HOST_AUTH_METHOD=scram-sha-256`, so every connection needs a real
+  password. The server never stores per-role secrets: each role's password is
+  derived as `HMAC-SHA256(password_secret, role)`, set on the role by the
+  role-sync DDL (and on the baseline role by initdb), and re-derived at connect
+  time. Keep `password_secret` itself out of source control in production (load
+  it from `${ENV}`).
 - **Managed roles are tightly scoped.** They are `LOGIN`, `NOSUPERUSER`,
   `NOCREATEROLE`, members of `pathql_readers`, and never members of one another.
   So a managed role can read its own rows and nothing else, and cannot become

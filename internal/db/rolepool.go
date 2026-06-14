@@ -4,10 +4,9 @@ package db
 // login_role RLS model every request runs as the caller's own database role,
 // so each role needs its own connection pool whose connections authenticate as
 // that role. RolePools lazily creates one pool per role by appending
-// "user=<role>" to a base DSN (trust/peer auth on an isolated channel, so no
-// per-user password is stored), bounds the total number of backends in use
-// across all pools with a global semaphore, and keeps only a limited number of
-// pools warm (holding idle connections) using an LRU.
+// "user=<role>" and the role's derived password to a base DSN, bounds the total
+// number of backends in use across all pools with a global semaphore, and keeps
+// only a limited number of pools warm (holding idle connections) using an LRU.
 //
 // pathsqlx.Open is lazy: it does not dial a connection until a query runs.
 // Nothing in this file runs a query, so the manager can be fully unit tested
@@ -41,12 +40,10 @@ type PoolParams struct {
 	ConnMaxIdleTime time.Duration
 }
 
-// rolePool is the internal per-role entry: the lazily-opened pool, any per-role
-// parameter override (nil means inherit the defaults) and the last time the
-// role was acquired, used by the warm-pool LRU.
+// rolePool is the internal per-role entry: the lazily-opened pool and the last
+// time the role was acquired, used by the warm-pool LRU.
 type rolePool struct {
 	db         *pathsqlx.DB
-	override   *PoolParams
 	lastUsed   time.Time
 	cooledDown bool
 }
@@ -76,17 +73,14 @@ type RolePools struct {
 	mu       sync.Mutex
 	defaults PoolParams
 	pools    map[string]*rolePool
-	// pending holds overrides set via SetRole for roles that have no pool yet.
-	// They are applied when the pool is first created on Acquire.
-	pending map[string]*PoolParams
 	// password, when non-nil, supplies the connection password for a role; it is
-	// appended to the DSN as "password=<value>". Nil means trust/peer auth.
+	// appended to the DSN as "password=<value>". Nil appends no password.
 	password func(role string) string
 }
 
 // UseRolePassword sets the function that supplies each role's connection
-// password (login_role password auth). It must be called once at startup before
-// any Acquire. A nil function leaves trust/peer auth in effect.
+// password (login_role auth). It must be called once at startup before any
+// Acquire. A nil function appends no password.
 func (p *RolePools) UseRolePassword(fn func(role string) string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -99,7 +93,7 @@ func (p *RolePools) UseRolePassword(fn func(role string) string) {
 // "user=<role>" when a pool is created. maxTotalBackends bounds the number of
 // connections in use across ALL pools at once via a global semaphore. warmLimit
 // bounds how many pools keep idle connections, enforced by an LRU. defaults is
-// the seed PoolParams applied to each new pool that has no override.
+// the PoolParams applied to each pool.
 //
 // It returns an error if baseDSN is empty or maxTotalBackends is less than 1.
 func NewRolePools(driver, baseDSN string, maxTotalBackends, warmLimit int, defaults PoolParams) (*RolePools, error) {
@@ -138,16 +132,6 @@ func roleDSN(baseDSN, role string) (string, error) {
 		return "", fmt.Errorf("db: invalid role %q: must match %s", role, roleNameRe.String())
 	}
 	return baseDSN + " user=" + role, nil
-}
-
-// effective resolves the parameters for a pool: the per-role override if one is
-// set, otherwise the defaults. It is a pure helper so the precedence rule can
-// be tested in isolation.
-func effective(defaults PoolParams, override *PoolParams) PoolParams {
-	if override != nil {
-		return *override
-	}
-	return defaults
 }
 
 // applyParams pushes pp onto the underlying database/sql pool. The pathsqlx.DB
@@ -197,7 +181,7 @@ func rolesToCoolDown(lastUsed map[string]time.Time, warmLimit int) []string {
 }
 
 // getOrCreatePool returns the pool for role, creating it lazily on first use
-// with the effective parameters. It must be called with p.mu held.
+// with the configured pool parameters. It must be called with p.mu held.
 func (p *RolePools) getOrCreatePool(role string) (*rolePool, error) {
 	if rp, ok := p.pools[role]; ok {
 		return rp, nil
@@ -216,19 +200,15 @@ func (p *RolePools) getOrCreatePool(role string) (*rolePool, error) {
 		return nil, err
 	}
 	rp := &rolePool{db: db}
-	if pp, ok := p.pending[role]; ok {
-		rp.override = pp
-		delete(p.pending, role)
-	}
-	applyParams(db, effective(p.defaults, rp.override))
+	applyParams(db, p.defaults)
 	p.pools[role] = rp
 	return rp, nil
 }
 
 // reconcileWarm applies the warm-pool LRU. It must be called with p.mu held.
 // Pools chosen by rolesToCoolDown have MaxIdleConns forced to zero so they
-// retain no idle connection; pools within the limit are restored to their
-// effective MaxIdle. The pools are never evicted, so in-flight use keeps
+// retain no idle connection; pools within the limit are restored to the
+// configured MaxIdle. The pools are never evicted, so in-flight use keeps
 // working.
 func (p *RolePools) reconcileWarm() {
 	lastUsed := make(map[string]time.Time, len(p.pools))
@@ -249,8 +229,8 @@ func (p *RolePools) reconcileWarm() {
 			continue
 		}
 		if rp.cooledDown {
-			// Restore the warm idle count from the effective params.
-			rp.db.DB.DB.SetMaxIdleConns(effective(p.defaults, rp.override).MaxIdle)
+			// Restore the warm idle count from the defaults.
+			rp.db.DB.DB.SetMaxIdleConns(p.defaults.MaxIdle)
 			rp.cooledDown = false
 		}
 	}
@@ -258,7 +238,7 @@ func (p *RolePools) reconcileWarm() {
 
 // Acquire blocks until a global semaphore slot is free or ctx is done. On
 // success it returns the pool authenticated as role, created lazily on first
-// use with the effective params, and a release func that returns the slot to
+// use with the configured params, and a release func that returns the slot to
 // the semaphore. The release func is safe to call exactly once.
 //
 // role must match ^[A-Za-z_][A-Za-z0-9_]*$ because it is interpolated into the
@@ -294,48 +274,6 @@ func (p *RolePools) Acquire(ctx context.Context, role string) (pool *pathsqlx.DB
 	return db, release, nil
 }
 
-// SetDefaults replaces the seed parameters and re-applies them live to every
-// pool that has no per-role override. Pools with an override keep it.
-func (p *RolePools) SetDefaults(pp PoolParams) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.defaults = pp
-	for _, rp := range p.pools {
-		if rp.override == nil {
-			applyParams(rp.db, pp)
-		}
-	}
-	// Re-apply the warm LRU because changing MaxIdle on the kept-warm pools and
-	// the cooled-down pools must stay consistent.
-	p.reconcileWarm()
-}
-
-// SetRole sets or clears the per-role parameter override and re-applies it live.
-// A nil pp clears the override so the role inherits the current defaults. If the
-// role has no pool yet the override is recorded and applied when the pool is
-// created.
-func (p *RolePools) SetRole(role string, pp *PoolParams) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	rp, ok := p.pools[role]
-	if !ok {
-		// No live pool yet, so remember the override (or clear a remembered
-		// one) and apply it when the pool is created lazily on first Acquire.
-		if pp == nil {
-			delete(p.pending, role)
-			return
-		}
-		if p.pending == nil {
-			p.pending = make(map[string]*PoolParams)
-		}
-		p.pending[role] = pp
-		return
-	}
-	rp.override = pp
-	applyParams(rp.db, effective(p.defaults, rp.override))
-	p.reconcileWarm()
-}
-
 // Stats returns a snapshot of sql.DBStats for each live pool, keyed by role.
 func (p *RolePools) Stats() map[string]sql.DBStats {
 	p.mu.Lock()
@@ -357,7 +295,6 @@ func (p *RolePools) Evict(role string) {
 	if ok {
 		delete(p.pools, role)
 	}
-	delete(p.pending, role)
 	p.mu.Unlock()
 	if ok {
 		_ = rp.db.DB.DB.Close()
@@ -370,7 +307,6 @@ func (p *RolePools) Close() error {
 	p.mu.Lock()
 	pools := p.pools
 	p.pools = make(map[string]*rolePool)
-	p.pending = nil
 	p.mu.Unlock()
 	var firstErr error
 	for _, rp := range pools {

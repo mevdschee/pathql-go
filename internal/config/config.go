@@ -16,7 +16,7 @@ import (
 // Config is the top-level server configuration.
 type Config struct {
 	Driver  string `toml:"driver"` // required
-	DSN     string `toml:"dsn"`    // required; supports ${ENV} expansion
+	DSN     string `toml:"dsn"`    // shared connection string; required when identity_kind is "none", supports ${ENV}
 	Listen  string `toml:"listen"` // default ":8000"
 	Verbose bool   `toml:"verbose"`
 
@@ -38,17 +38,16 @@ type Database struct {
 	ConnMaxLifetimeMs int `toml:"conn_max_lifetime_ms"`  // default 300000 (5m); seed
 	ConnMaxIdleTimeMs int `toml:"conn_max_idle_time_ms"` // default 60000 (1m); seed
 	// MaxTotalBackends is the hard ceiling on simultaneous database connections
-	// across all per-role pools (login_role mode), enforced by a shared
-	// semaphore. Config only: never exposed by the admin API. Default 200.
+	// across all per-role pools, enforced by a shared semaphore. Config only:
+	// never exposed by the admin API. Default 200.
 	MaxTotalBackends int `toml:"max_total_backends"`
 }
 
 // Security holds auth-table and RLS settings.
 type Security struct {
-	AuthTablePrefix         string   `toml:"auth_table_prefix"`         // default "pathql_auth_"
-	SessionVariable         string   `toml:"session_variable"`          // default "app.user" (parsed, Phase 3)
-	ReadOnly                bool     `toml:"read_only"`                 // parsed, Phase 3
-	TrustedProxies          []string `toml:"trusted_proxies"`           // parsed, Phase 5
+	AuthTablePrefix string   `toml:"auth_table_prefix"` // default "pathql_auth_"
+	ReadOnly        bool     `toml:"read_only"`
+	TrustedProxies  []string `toml:"trusted_proxies"`
 	// MetricsUser is the app_user identity allowed to read GET /metrics on the
 	// main listener; that principal may ONLY read metrics. Empty disables the
 	// metrics endpoint entirely (fail closed). Default "metrics".
@@ -57,10 +56,16 @@ type Security struct {
 	// "off" skips it, "warn" (default) logs findings, "enforce" refuses to start
 	// on a critical finding (superuser role or write privileges).
 	StartupChecks string `toml:"startup_checks"`
-	// IdentityKind selects how the caller's identity reaches RLS: "session_guc"
-	// (default) binds app.user with set_config and policies read current_setting;
-	// "login_role" connects as the caller's own database role and policies read
-	// current_user (unforgeable, see ROLE_MANAGEMENT_PLAN.md).
+	// IdentityKind selects the connection model and whether row-level security
+	// applies:
+	//   "none" (default) connects through a single shared pool (the top-level
+	//     dsn). No per-caller identity reaches the database, so there is no RLS
+	//     isolation: every authenticated caller runs as the same database role.
+	//     Simple to set up and the development/single-tenant on-ramp; auth is
+	//     optional.
+	//   "login_role" connects as the caller's own database role and policies read
+	//     current_user (unforgeable; see ROLE_MANAGEMENT_PLAN.md). This is how RLS
+	//     isolation is enforced. Hardened, but requires per-role provisioning.
 	IdentityKind string `toml:"identity_kind"`
 	// AdminUser is the app_user identity allowed on the /admin/* routes; that
 	// principal may only use admin routes. Empty disables them (fail closed).
@@ -99,10 +104,9 @@ type Limits struct {
 	WorkMemKB int `toml:"work_mem_kb"`
 }
 
-// Cache configures the abuse-protection / JWKS cache backend.
+// Cache configures the in-process abuse-protection / JWKS cache. The cache is
+// always the embedded, memory-bounded backend; there is no pluggable backend.
 type Cache struct {
-	Backend  string `toml:"backend"`   // "embedded" (default). "memcached" is not implemented yet.
-	Address  string `toml:"address"`   // optional, backend-specific
 	MemoryMB int    `toml:"memory_mb"` // default 64
 	AuthTTL  string `toml:"auth_ttl"`  // duration string, default "30s"
 	JWKSTTL  string `toml:"jwks_ttl"`  // duration string, default "1h"
@@ -125,14 +129,14 @@ type CORS struct {
 	AllowedOrigins []string `toml:"allowed_origins"` // explicit list; never "*" with credentials
 }
 
-// Roles configures the login_role connection model and role synchronization.
-// Only used when security.identity_kind = "login_role".
+// Roles configures the per-role connection model and role synchronization, used
+// only when security.identity_kind = "login_role". The server connects as each
+// caller's own database role so RLS policies read an unforgeable current_user.
 type Roles struct {
 	// BaseDSN is the connection string WITHOUT a user, for example
 	// "host=db port=5432 dbname=pathql sslmode=disable". The server appends
-	// "user=<role>" to open a connection authenticated (trust/peer on an isolated
-	// channel) as a specific role. Supports ${ENV} expansion. Required in
-	// login_role mode.
+	// "user=<role>" and the role's derived password to open a connection
+	// authenticated as a specific role. Supports ${ENV} expansion. Required.
 	BaseDSN string `toml:"base_dsn"`
 	// BaselineRole is the role the server connects as for pre-auth work (reading
 	// the auth tables) before the caller is known. Default "pathql_auth".
@@ -146,14 +150,11 @@ type Roles struct {
 	// WarmPoolLimit caps how many per-role pools keep a warm idle connection
 	// (LRU). Config only, never exposed by the admin API. Default 64.
 	WarmPoolLimit int `toml:"warm_pool_limit"`
-	// Auth selects how the per-role connections authenticate: "trust" (default;
-	// trust/peer on an isolated channel, no secret) or "password" (each role's
-	// password is derived from PasswordSecret; pair with scram-sha-256 in
-	// pg_hba.conf for production).
-	Auth string `toml:"auth"`
 	// PasswordSecret is the master secret each role password is derived from
-	// (HMAC-SHA256 of the role name). Required when Auth = "password".
-	// ${ENV}-expandable; keep it out of the file.
+	// (HMAC-SHA256 of the role name). Per-role connections authenticate with this
+	// derived password, so pair it with scram-sha-256 in pg_hba.conf for
+	// production. Required in login_role mode. ${ENV}-expandable; keep it out of
+	// the file.
 	PasswordSecret string `toml:"password_secret"`
 }
 
@@ -175,12 +176,12 @@ var rolePrefixRe = regexp.MustCompile(`^[a-z_][a-z0-9_]*$`)
 // sqlIdentRe validates a bare SQL identifier used as a role name in config.
 var sqlIdentRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
-// envTokenRe matches ${VAR} tokens for DSN expansion.
+// envTokenRe matches ${VAR} tokens for secret/DSN expansion.
 var envTokenRe = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
 
 // Load decodes a TOML config file, applies defaults to zero-valued fields,
-// expands ${ENV} tokens in DSN, applies the PATHQL_DSN env override if set,
-// then validates. Returns a usable *Config or an error (fail closed).
+// expands ${ENV} tokens in the secrets it carries, then validates. Returns a
+// usable *Config or an error (fail closed).
 func Load(path string) (*Config, error) {
 	var cfg Config
 	md, err := toml.DecodeFile(path, &cfg)
@@ -195,17 +196,16 @@ func Load(path string) (*Config, error) {
 
 	cfg.applyDefaults()
 
-	// Expand ${ENV} tokens in the file-provided DSN.
+	// Expand ${ENV} tokens in the shared DSN, the JWT HS256 secret, the per-role
+	// base DSN and the role password secret so secrets stay out of the config file.
 	cfg.DSN = expandEnv(cfg.DSN)
-
-	// Expand ${ENV} tokens in the JWT HS256 secret (same mechanism as DSN).
 	cfg.Auth.JWTHS256Secret = expandEnv(cfg.Auth.JWTHS256Secret)
-
-	// Expand ${ENV} tokens in the login_role base DSN and password secret.
 	cfg.Roles.BaseDSN = expandEnv(cfg.Roles.BaseDSN)
 	cfg.Roles.PasswordSecret = expandEnv(cfg.Roles.PasswordSecret)
 
-	// A non-empty PATHQL_DSN overrides the file DSN entirely, used verbatim.
+	// A non-empty PATHQL_DSN overrides the file DSN entirely, used verbatim (no
+	// further ${ENV} expansion), so a deployment can inject the connection string
+	// from the environment without editing the file.
 	if override := os.Getenv("PATHQL_DSN"); override != "" {
 		cfg.DSN = override
 	}
@@ -249,9 +249,6 @@ func (c *Config) applyDefaults() {
 	if c.Security.AuthTablePrefix == "" {
 		c.Security.AuthTablePrefix = "pathql_auth_"
 	}
-	if c.Security.SessionVariable == "" {
-		c.Security.SessionVariable = "app.user"
-	}
 	if c.Security.MetricsUser == "" {
 		c.Security.MetricsUser = "metrics"
 	}
@@ -259,7 +256,7 @@ func (c *Config) applyDefaults() {
 		c.Security.StartupChecks = "warn"
 	}
 	if c.Security.IdentityKind == "" {
-		c.Security.IdentityKind = "session_guc"
+		c.Security.IdentityKind = "none"
 	}
 
 	if c.Roles.BaselineRole == "" {
@@ -273,9 +270,6 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Roles.WarmPoolLimit == 0 {
 		c.Roles.WarmPoolLimit = 64
-	}
-	if c.Roles.Auth == "" {
-		c.Roles.Auth = "trust"
 	}
 
 	if c.Auth.APIKeyHeader == "" {
@@ -307,9 +301,6 @@ func (c *Config) applyDefaults() {
 		c.Limits.MaxAuthFailuresPerMin = 60
 	}
 
-	if c.Cache.Backend == "" {
-		c.Cache.Backend = "embedded"
-	}
 	if c.Cache.MemoryMB == 0 {
 		c.Cache.MemoryMB = 64
 	}
@@ -345,9 +336,6 @@ func (c *Config) validate() error {
 	if c.Driver == "" {
 		return fmt.Errorf("config: driver is required")
 	}
-	if c.Security.IdentityKind != "login_role" && c.DSN == "" {
-		return fmt.Errorf("config: dsn is required (empty after env expansion)")
-	}
 
 	jwtEnabled := false
 	for _, m := range c.Auth.Methods {
@@ -380,9 +368,16 @@ func (c *Config) validate() error {
 	}
 
 	switch c.Security.IdentityKind {
-	case "session_guc":
-		// the default GUC binding; no extra requirements
+	case "none":
+		// The simple on-ramp: one shared connection (the top-level dsn), no RLS.
+		// Auth is optional here.
+		if c.DSN == "" {
+			return fmt.Errorf("config: dsn is required when identity_kind is none (empty after env expansion)")
+		}
 	case "login_role":
+		// The server connects as each caller's own database role, so it needs a
+		// principal to pick the role and a user-less base DSN to build per-role
+		// connections from.
 		if len(c.Auth.Methods) == 0 {
 			return fmt.Errorf("config: identity_kind login_role requires at least one auth method (it needs a principal to pick a role)")
 		}
@@ -398,25 +393,11 @@ func (c *Config) validate() error {
 		if !sqlIdentRe.MatchString(c.Roles.ReaderRole) {
 			return fmt.Errorf("config: roles.reader_role %q must be a valid identifier", c.Roles.ReaderRole)
 		}
-		switch c.Roles.Auth {
-		case "trust":
-			// no secret needed
-		case "password":
-			if c.Roles.PasswordSecret == "" {
-				return fmt.Errorf("config: roles.auth=password requires roles.password_secret (empty after env expansion)")
-			}
-		default:
-			return fmt.Errorf(`config: roles.auth %q must be "trust" or "password"`, c.Roles.Auth)
+		if c.Roles.PasswordSecret == "" {
+			return fmt.Errorf("config: identity_kind login_role requires roles.password_secret (empty after env expansion)")
 		}
 	default:
-		return fmt.Errorf("config: identity_kind %q must be one of session_guc, login_role", c.Security.IdentityKind)
-	}
-
-	switch c.Cache.Backend {
-	case "embedded":
-		// supported
-	default:
-		return fmt.Errorf("config: cache backend %q not supported yet (use embedded)", c.Cache.Backend)
+		return fmt.Errorf("config: identity_kind %q must be one of none, login_role", c.Security.IdentityKind)
 	}
 
 	if c.TLS.Enabled {
@@ -452,4 +433,44 @@ func (c *Config) validateJWT() error {
 		return fmt.Errorf("config: jwt asymmetric algorithms require jwt_jwks_url")
 	}
 	return nil
+}
+
+// knownWeakRoleSecrets are placeholder, demo, and obviously-guessable values that
+// must never be used as a real roles.password_secret. Keys are lowercased; the
+// "login-role-demo-secret" entry is the value the bundled example ships with.
+var knownWeakRoleSecrets = map[string]bool{
+	"login-role-demo-secret": true,
+	"changeme":               true,
+	"change-me":              true,
+	"changeit":               true,
+	"secret":                 true,
+	"password":               true,
+	"password_secret":        true,
+	"test":                   true,
+	"demo":                   true,
+	"example":                true,
+}
+
+// minRoleSecretLen is the shortest roles.password_secret the startup hardening
+// check accepts without flagging it as low-entropy. The secret is the HMAC key
+// every managed role's database password is derived from, so it should be a long
+// random value, not a short or memorable one.
+const minRoleSecretLen = 16
+
+// WeakRoleSecretFinding reports whether the configured roles.password_secret
+// looks weak, returning a human-readable finding when it does. A secret is weak
+// when it is a known placeholder/demo value or is shorter than minRoleSecretLen.
+// Because the secret derives every managed role's database password via HMAC, a
+// guessable or checked-in value lets anyone who learns it connect as any user,
+// so the operator must set a long, random secret (loaded from the environment in
+// production).
+func (c *Config) WeakRoleSecretFinding() (string, bool) {
+	secret := c.Roles.PasswordSecret
+	if knownWeakRoleSecrets[strings.ToLower(secret)] {
+		return "roles.password_secret is a known placeholder/demo value: set a long, random secret (it derives every managed role's database password)", true
+	}
+	if len(secret) < minRoleSecretLen {
+		return fmt.Sprintf("roles.password_secret is only %d characters: use at least %d random characters (it derives every managed role's database password)", len(secret), minRoleSecretLen), true
+	}
+	return "", false
 }

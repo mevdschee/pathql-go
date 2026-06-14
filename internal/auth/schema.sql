@@ -72,7 +72,7 @@ CREATE TABLE pathql_auth_api_keys (
 -- expires.
 
 -- ---------------------------------------------------------------------------
--- login_role pool tuning (only needed when security.identity_kind = "login_role")
+-- Per-role connection-pool tuning
 -- ---------------------------------------------------------------------------
 -- Per-user connection-pool overrides, set via PUT /admin/users/{id}/pool. NULL
 -- means inherit the global default.

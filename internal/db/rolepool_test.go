@@ -71,26 +71,6 @@ func TestRoleDSN(t *testing.T) {
 	}
 }
 
-func TestEffective(t *testing.T) {
-	defaults := PoolParams{MaxOpen: 10, MaxIdle: 5, ConnMaxLifetime: time.Minute, ConnMaxIdleTime: time.Second}
-	override := PoolParams{MaxOpen: 3, MaxIdle: 1, ConnMaxLifetime: 2 * time.Minute, ConnMaxIdleTime: 2 * time.Second}
-	tests := []struct {
-		name     string
-		override *PoolParams
-		want     PoolParams
-	}{
-		{name: "nil override uses defaults", override: nil, want: defaults},
-		{name: "override wins", override: &override, want: override},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := effective(defaults, tc.override); got != tc.want {
-				t.Errorf("effective() = %+v, want %+v", got, tc.want)
-			}
-		})
-	}
-}
-
 func TestNewRolePoolsValidation(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -237,7 +217,7 @@ func TestReleaseIsIdempotent(t *testing.T) {
 	release2()
 }
 
-func TestSetDefaultsReappliesLive(t *testing.T) {
+func TestAppliesConfiguredDefaults(t *testing.T) {
 	p, _ := newTestPools(t, 4, 8, PoolParams{MaxOpen: 7, MaxIdle: 3})
 
 	_, release, err := p.Acquire(context.Background(), "role_a")
@@ -247,45 +227,7 @@ func TestSetDefaultsReappliesLive(t *testing.T) {
 	release()
 
 	if got := p.Stats()["role_a"].MaxOpenConnections; got != 7 {
-		t.Fatalf("before SetDefaults MaxOpenConnections = %d, want 7", got)
-	}
-
-	p.SetDefaults(PoolParams{MaxOpen: 11, MaxIdle: 4})
-	if got := p.Stats()["role_a"].MaxOpenConnections; got != 11 {
-		t.Errorf("after SetDefaults MaxOpenConnections = %d, want 11", got)
-	}
-}
-
-func TestSetRoleOverride(t *testing.T) {
-	p, _ := newTestPools(t, 4, 8, PoolParams{MaxOpen: 7, MaxIdle: 3})
-
-	// Override before the pool exists: it must be honored on first Acquire.
-	p.SetRole("role_a", &PoolParams{MaxOpen: 2, MaxIdle: 1})
-	_, release, err := p.Acquire(context.Background(), "role_a")
-	if err != nil {
-		t.Fatalf("Acquire returned error: %v", err)
-	}
-	release()
-	if got := p.Stats()["role_a"].MaxOpenConnections; got != 2 {
-		t.Errorf("override before create: MaxOpenConnections = %d, want 2", got)
-	}
-
-	// SetDefaults must not disturb a pool that has an override.
-	p.SetDefaults(PoolParams{MaxOpen: 20, MaxIdle: 10})
-	if got := p.Stats()["role_a"].MaxOpenConnections; got != 2 {
-		t.Errorf("override should survive SetDefaults: MaxOpenConnections = %d, want 2", got)
-	}
-
-	// Change the override live.
-	p.SetRole("role_a", &PoolParams{MaxOpen: 5, MaxIdle: 2})
-	if got := p.Stats()["role_a"].MaxOpenConnections; got != 5 {
-		t.Errorf("changed override: MaxOpenConnections = %d, want 5", got)
-	}
-
-	// Clear the override: the pool falls back to the current defaults.
-	p.SetRole("role_a", nil)
-	if got := p.Stats()["role_a"].MaxOpenConnections; got != 20 {
-		t.Errorf("cleared override should inherit defaults: MaxOpenConnections = %d, want 20", got)
+		t.Errorf("MaxOpenConnections = %d, want 7 (the configured default)", got)
 	}
 }
 
@@ -411,13 +353,6 @@ func TestEvictRemovesPool(t *testing.T) {
 	}
 	// Evicting an unknown role is a no-op.
 	p.Evict("role_nonexistent")
-
-	// A pending override for an evicted role must be dropped too.
-	p.SetRole("role_b", &PoolParams{MaxOpen: 3})
-	p.Evict("role_b")
-	if _, ok := p.pending["role_b"]; ok {
-		t.Error("pending override for role_b survived Evict")
-	}
 }
 
 func TestCloseClosesAll(t *testing.T) {

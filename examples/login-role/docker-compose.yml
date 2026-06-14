@@ -16,11 +16,12 @@ services:
     environment:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: pathql
-      # trust auth lets the server connect as any role with no password. This is
-      # ONLY safe because the database is reachable solely over the isolated
-      # compose network; nothing here is exposed to untrusted clients. Never use
-      # trust on a network that anyone untrusted can reach.
-      POSTGRES_HOST_AUTH_METHOD: trust
+      # Require a real password (SCRAM) for every TCP connection. The server
+      # connects as each per-user role with the password derived from
+      # password_secret in config.ini; the matching verifiers are set on the roles
+      # by initdb (the baseline role) and by the role-sync DDL (the per-user
+      # roles).
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
     # initdb scripts run once, in filename order, on first boot only.
     volumes:
       - ./initdb:/docker-entrypoint-initdb.d:ro
@@ -40,15 +41,15 @@ services:
       retries: 30
 
   server:
-    # Reuse the sibling demo's Dockerfile; build context is the repo root.
+    # Build context is the repo root so the whole module is available.
     build:
       context: ../..
-      dockerfile: examples/demo/Dockerfile
+      dockerfile: examples/login-role/Dockerfile
     depends_on:
       db:
         condition: service_healthy
-    # No DB password env is needed: each per-role connection authenticates by
-    # trust over the compose network.
+    # Each per-role connection authenticates with the password derived from
+    # password_secret in config.ini; no separate DB password env is needed.
     volumes:
       - ./config.ini:/app/config.ini:ro
     ports:

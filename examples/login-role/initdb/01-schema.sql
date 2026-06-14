@@ -10,7 +10,11 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 -- catalog reads (it produces the role-sync diff by reading pg_roles). It is the
 -- `baseline_role` in config.ini. It is deliberately unprivileged on the data
 -- tables: it can read and write the auth tables, but cannot read `documents`.
-CREATE ROLE pathql_auth LOGIN;
+-- The password is HMAC-SHA256(password_secret, 'pathql_auth') truncated to 32
+-- hex chars, with password_secret = "login-role-demo-secret" from config.ini, so
+-- it matches what the server re-derives at connect time. The per-user roles get
+-- their passwords the same way from the /admin/roles/sync DDL.
+CREATE ROLE pathql_auth LOGIN PASSWORD 'd1033b5134f5c47bcb652023902a941f';
 
 -- The shared reader group. Every managed per-user login role is granted
 -- membership in this role; the RLS policy below grants SELECT to this group.

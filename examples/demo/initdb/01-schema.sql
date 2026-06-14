@@ -1,19 +1,22 @@
--- Demo schema for pathql-server. Runs once, as the postgres superuser, against
--- the `pathql` database on first container boot. Creates:
+-- Demo schema for pathql-server (simple, no-RLS mode). Runs once, as the
+-- postgres superuser, against the `pathql` database on first container boot.
+-- Creates:
 --   * the least-privilege pathql_app role the server connects as
 --   * the auth tables (pathql_auth_users, pathql_auth_api_keys)
 --   * sample content tables (categories, posts, comments) matching the examples
 --     in ../../README.md
---   * a documents table protected by row-level security, to show RLS isolation
 -- Data is loaded separately in 02-seed.sql.
+--
+-- This is the single-connection model: every request runs as pathql_app, so
+-- there is no per-user isolation. For row-level security per user see the
+-- sibling examples/login-role demo.
 
 -- pgcrypto gives us digest() for API-key hashes and crypt()/gen_salt() for the
 -- bcrypt password hashes the Basic authenticator expects.
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
--- The role the server logs in as. NOT a superuser and NOT the owner of the
--- tables below, so row-level security actually applies to it. The password must
--- match PATHQL_DB_PASSWORD in docker-compose.yml.
+-- The role the server logs in as. NOT a superuser; read-only on the content.
+-- The password must match the dsn in config.ini.
 CREATE ROLE pathql_app LOGIN PASSWORD 'pathql_demo_pw';
 
 -- ---------------------------------------------------------------------------
@@ -62,30 +65,8 @@ CREATE TABLE comments (
 );
 
 -- ---------------------------------------------------------------------------
--- Row-level security demo. Each row has an owner; the policy only exposes rows
--- whose owner matches the identity the server binds into app.user. An
--- unauthenticated request leaves app.user unset, so current_setting(...) is
--- NULL and no rows match.
--- ---------------------------------------------------------------------------
-CREATE TABLE documents (
-  id    bigint PRIMARY KEY,
-  owner text NOT NULL,
-  body  text NOT NULL
-);
-
-ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
-
-CREATE POLICY documents_owner_select
-  ON documents
-  FOR SELECT
-  TO pathql_app
-  USING (owner = current_setting('app.user', true));
-
--- ---------------------------------------------------------------------------
 -- Grants. The server only ever reads, so SELECT is enough, except for the
 -- best-effort last_used_at bump on API keys (a column-scoped UPDATE).
--- See ../rls_policy.sql for the full production hardening (explicit REVOKEs of
--- write access and dangerous built-in functions).
 -- ---------------------------------------------------------------------------
 GRANT CONNECT ON DATABASE pathql TO pathql_app;
 GRANT USAGE ON SCHEMA public TO pathql_app;
@@ -94,10 +75,7 @@ GRANT UPDATE (last_used_at) ON pathql_auth_api_keys TO pathql_app;
 
 -- Defense in depth: revoke the dangerous built-in functions so a query cannot
 -- sleep to cause a DoS or read/move large objects. EXECUTE on these is granted
--- to PUBLIC by default, so the revoke MUST target PUBLIC: revoking only from the
--- app role leaves the privilege it inherits through PUBLIC intact. Revoking a
--- function PUBLIC never had is a harmless no-op. This also keeps the server's
--- startup hardening self-check clean (only the intentional no-RLS tables warn).
+-- to PUBLIC by default, so the revoke MUST target PUBLIC.
 REVOKE EXECUTE ON FUNCTION pg_read_file(text)            FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION pg_read_binary_file(text)     FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION pg_ls_dir(text)               FROM PUBLIC;
