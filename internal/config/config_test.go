@@ -177,6 +177,16 @@ base_dsn = "host=localhost dbname=pathql sslmode=disable"
 			wantMsg: "auth method",
 		},
 		{
+			name:    "login_role password auth without secret",
+			content: "driver=\"postgres\"\n[security]\nidentity_kind=\"login_role\"\n[auth]\nmethods=[\"apikey\"]\n[roles]\nbase_dsn=\"host=localhost dbname=pathql\"\nauth=\"password\"\n",
+			wantMsg: "password_secret",
+		},
+		{
+			name:    "login_role bad roles auth",
+			content: "driver=\"postgres\"\n[security]\nidentity_kind=\"login_role\"\n[auth]\nmethods=[\"apikey\"]\n[roles]\nbase_dsn=\"host=localhost dbname=pathql\"\nauth=\"bogus\"\n",
+			wantMsg: "roles.auth",
+		},
+		{
 			name:    "unknown identity_kind",
 			content: "driver=\"postgres\"\ndsn=\"host=localhost dbname=pathql\"\n[security]\nidentity_kind=\"bogus\"\n",
 			wantMsg: "identity_kind",

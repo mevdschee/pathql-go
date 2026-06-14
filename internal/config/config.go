@@ -49,7 +49,6 @@ type Security struct {
 	SessionVariable         string   `toml:"session_variable"`          // default "app.user" (parsed, Phase 3)
 	ReadOnly                bool     `toml:"read_only"`                 // parsed, Phase 3
 	TrustedProxies          []string `toml:"trusted_proxies"`           // parsed, Phase 5
-	BlockMultipleStatements bool     `toml:"block_multiple_statements"` // default true
 	// MetricsUser is the app_user identity allowed to read GET /metrics on the
 	// main listener; that principal may ONLY read metrics. Empty disables the
 	// metrics endpoint entirely (fail closed). Default "metrics".
@@ -147,6 +146,15 @@ type Roles struct {
 	// WarmPoolLimit caps how many per-role pools keep a warm idle connection
 	// (LRU). Config only, never exposed by the admin API. Default 64.
 	WarmPoolLimit int `toml:"warm_pool_limit"`
+	// Auth selects how the per-role connections authenticate: "trust" (default;
+	// trust/peer on an isolated channel, no secret) or "password" (each role's
+	// password is derived from PasswordSecret; pair with scram-sha-256 in
+	// pg_hba.conf for production).
+	Auth string `toml:"auth"`
+	// PasswordSecret is the master secret each role password is derived from
+	// (HMAC-SHA256 of the role name). Required when Auth = "password".
+	// ${ENV}-expandable; keep it out of the file.
+	PasswordSecret string `toml:"password_secret"`
 }
 
 // Timeouts holds HTTP server timeouts in milliseconds.
@@ -180,12 +188,6 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("config: load %q: %w", path, err)
 	}
 
-	// block_multiple_statements defaults to true; only an explicit false in the
-	// file may disable it. A plain zero-value default cannot distinguish "unset"
-	// from "set to false", so consult the decode metadata.
-	if !md.IsDefined("security", "block_multiple_statements") {
-		cfg.Security.BlockMultipleStatements = true
-	}
 	// tls.hsts defaults to true; same unset-vs-false distinction as above.
 	if !md.IsDefined("tls", "hsts") {
 		cfg.TLS.HSTS = true
@@ -199,8 +201,9 @@ func Load(path string) (*Config, error) {
 	// Expand ${ENV} tokens in the JWT HS256 secret (same mechanism as DSN).
 	cfg.Auth.JWTHS256Secret = expandEnv(cfg.Auth.JWTHS256Secret)
 
-	// Expand ${ENV} tokens in the login_role base DSN (same mechanism as DSN).
+	// Expand ${ENV} tokens in the login_role base DSN and password secret.
 	cfg.Roles.BaseDSN = expandEnv(cfg.Roles.BaseDSN)
+	cfg.Roles.PasswordSecret = expandEnv(cfg.Roles.PasswordSecret)
 
 	// A non-empty PATHQL_DSN overrides the file DSN entirely, used verbatim.
 	if override := os.Getenv("PATHQL_DSN"); override != "" {
@@ -270,6 +273,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Roles.WarmPoolLimit == 0 {
 		c.Roles.WarmPoolLimit = 64
+	}
+	if c.Roles.Auth == "" {
+		c.Roles.Auth = "trust"
 	}
 
 	if c.Auth.APIKeyHeader == "" {
@@ -391,6 +397,16 @@ func (c *Config) validate() error {
 		}
 		if !sqlIdentRe.MatchString(c.Roles.ReaderRole) {
 			return fmt.Errorf("config: roles.reader_role %q must be a valid identifier", c.Roles.ReaderRole)
+		}
+		switch c.Roles.Auth {
+		case "trust":
+			// no secret needed
+		case "password":
+			if c.Roles.PasswordSecret == "" {
+				return fmt.Errorf("config: roles.auth=password requires roles.password_secret (empty after env expansion)")
+			}
+		default:
+			return fmt.Errorf(`config: roles.auth %q must be "trust" or "password"`, c.Roles.Auth)
 		}
 	default:
 		return fmt.Errorf("config: identity_kind %q must be one of session_guc, login_role", c.Security.IdentityKind)

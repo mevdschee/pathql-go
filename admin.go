@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -152,17 +153,37 @@ func adminDeleteUser(w http.ResponseWriter, req *http.Request) {
 // to make the database login roles match the users table, for a cron job to
 // apply. The server never runs this DDL itself.
 func adminRolesSync(w http.ResponseWriter, req *http.Request) {
-	plan, err := roles.LoadAndCompute(req.Context(), pool.DB, cfg.Security.AuthTablePrefix, cfg.Roles.Prefix, cfg.Roles.ReaderRole)
+	plan, err := roles.LoadAndCompute(req.Context(), pool.DB, cfg.Security.AuthTablePrefix, cfg.Roles.Prefix, cfg.Roles.ReaderRole, rolePasswordFunc())
 	if err != nil {
 		writeError(w, req, http.StatusInternalServerError, genericInternalError, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"create":       plan.Create,
-		"grant_reader": plan.GrantReader,
-		"drop":         plan.Drop,
-		"ddl":          plan.DDL,
+		"create":         plan.Create,
+		"grant_reader":   plan.GrantReader,
+		"alter_password": plan.AlterPassword,
+		"drop":           plan.Drop,
+		"ddl":            plan.DDL,
 	})
+}
+
+// rolePassword derives a managed role's connection password from the master
+// secret as the first 32 hex chars of HMAC-SHA256(secret, role). It is
+// deterministic, so the server re-derives the same password the sync DDL set.
+func rolePassword(secret, role string) string {
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(role))
+	return hex.EncodeToString(mac.Sum(nil))[:32]
+}
+
+// rolePasswordFunc returns the per-role password derivation closure when the
+// server is in login_role password mode, or nil for trust auth.
+func rolePasswordFunc() func(string) string {
+	if cfg.Security.IdentityKind != "login_role" || cfg.Roles.Auth != "password" {
+		return nil
+	}
+	secret := cfg.Roles.PasswordSecret
+	return func(role string) string { return rolePassword(secret, role) }
 }
 
 // newAPIKey returns a fresh random API key (48 hex chars from 24 random bytes).

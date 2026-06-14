@@ -79,6 +79,18 @@ type RolePools struct {
 	// pending holds overrides set via SetRole for roles that have no pool yet.
 	// They are applied when the pool is first created on Acquire.
 	pending map[string]*PoolParams
+	// password, when non-nil, supplies the connection password for a role; it is
+	// appended to the DSN as "password=<value>". Nil means trust/peer auth.
+	password func(role string) string
+}
+
+// UseRolePassword sets the function that supplies each role's connection
+// password (login_role password auth). It must be called once at startup before
+// any Acquire. A nil function leaves trust/peer auth in effect.
+func (p *RolePools) UseRolePassword(fn func(role string) string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.password = fn
 }
 
 // NewRolePools creates a RolePools. driver is the sql driver name. baseDSN is a
@@ -193,6 +205,11 @@ func (p *RolePools) getOrCreatePool(role string) (*rolePool, error) {
 	dsn, err := roleDSN(p.baseDSN, role)
 	if err != nil {
 		return nil, err
+	}
+	// password mode: append the role's password. The derived value is hex, so it
+	// needs no connection-string quoting.
+	if p.password != nil {
+		dsn += " password=" + p.password(role)
 	}
 	db, err := p.open(p.driver, dsn)
 	if err != nil {

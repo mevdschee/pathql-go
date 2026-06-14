@@ -411,14 +411,6 @@ func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
 		paths = map[string]string{}
 	}
 
-	// Reject multi-statement queries when configured. This is a conservative
-	// scan that ignores semicolons inside string literals and comments; a single
-	// optional trailing semicolon is allowed. See hasMultipleStatements.
-	if cfg != nil && cfg.Security.BlockMultipleStatements && hasMultipleStatements(request.Query) {
-		writeError(w, req, http.StatusBadRequest, "only a single statement is allowed", nil)
-		return
-	}
-
 	// Resolve the authenticated principal (nil when auth is disabled).
 	var principal *auth.Principal
 	appUser := ""
@@ -694,7 +686,11 @@ func main() {
 	// and rolePools serves queries on per-role connections.
 	baseDSN := cfg.DSN
 	if cfg.Security.IdentityKind == "login_role" {
+		pw := rolePasswordFunc() // nil in trust mode
 		baseDSN = cfg.Roles.BaseDSN + " user=" + cfg.Roles.BaselineRole
+		if pw != nil {
+			baseDSN += " password=" + pw(cfg.Roles.BaselineRole)
+		}
 		defaults := db.PoolParams{
 			MaxOpen:         cfg.Database.MaxOpenConns,
 			MaxIdle:         cfg.Database.MaxIdleConns,
@@ -705,8 +701,11 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
+		if pw != nil {
+			rolePools.UseRolePassword(pw)
+		}
 		defer rolePools.Close()
-		log.Printf("identity model: login_role (per-role connections, current_user RLS)")
+		log.Printf("identity model: login_role (per-role connections, current_user RLS, auth=%s)", cfg.Roles.Auth)
 	}
 	pool, err = db.OpenPool(
 		cfg.Driver,

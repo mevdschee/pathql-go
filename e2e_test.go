@@ -187,7 +187,6 @@ func baseE2EConfig(prefix string) *config.Config {
 	c.Security.AuthTablePrefix = prefix
 	c.Security.SessionVariable = "app.user"
 	c.Security.ReadOnly = true
-	c.Security.BlockMultipleStatements = true
 	c.Auth.Methods = []string{"apikey", "basic"}
 	c.Auth.APIKeyHeader = "X-API-Key"
 	c.Limits.MaxQueryMs = 5000

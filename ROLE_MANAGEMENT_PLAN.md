@@ -32,8 +32,11 @@ This plan assumes the login_role connection layer exists:
 
 - A mapping from the app-authenticated principal to a database role.
 - A per-role connection pool, where each connection authenticates as the user's
-  role (client cert plus a `pg_ident` map, or trust/peer on an isolated channel),
-  so no per-user password is stored.
+  role: trust/peer on an isolated channel (no secret), or a per-role password
+  derived from a master secret (`HMAC(secret, role)`, set by the sync DDL and
+  re-derived at connect time, paired with scram-sha-256). Client cert plus
+  `pg_ident` is impractical for dynamically created roles (a `pg_ident` line per
+  role plus a reload on every creation), so it is not used.
 - RLS policies keyed on `current_user`.
 
 If that layer is not yet built it becomes phase 0 of the build order below.

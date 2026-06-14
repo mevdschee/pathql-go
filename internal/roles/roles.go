@@ -71,6 +71,11 @@ type Inputs struct {
 	// ReaderMembers maps a managed role name to true when it already has
 	// ReaderRole granted, so an unnecessary GRANT is not re-emitted.
 	ReaderMembers map[string]bool
+	// Password, when non-nil, makes the DDL set each role's login password to
+	// Password(role): CREATE ROLE ... PASSWORD for new roles and ALTER ROLE ...
+	// PASSWORD for existing ones (so a fresh deployment or a secret rotation keeps
+	// every role's password in sync). Nil means trust/peer auth and no password.
+	Password func(role string) string
 }
 
 // Plan is the result of a diff: the role-level actions plus the exact, ordered
@@ -84,8 +89,12 @@ type Plan struct {
 	GrantReader []string
 	// Drop lists managed-prefixed roles that exist but are no longer expected.
 	Drop []string
-	// DDL is the ordered, idempotent statement list: all creates, then all
-	// grants, then all drops. Every identifier is quoted with pq.QuoteIdentifier.
+	// AlterPassword lists existing expected roles whose password is (re)set, only
+	// populated when Inputs.Password is non-nil.
+	AlterPassword []string
+	// DDL is the ordered, idempotent statement list: all creates, then password
+	// alters, then all grants, then all drops. Every identifier is quoted with
+	// pq.QuoteIdentifier and every password literal with pq.QuoteLiteral.
 	DDL []string
 }
 
@@ -158,11 +167,23 @@ func Compute(in Inputs) (Plan, error) {
 		}
 	}
 
+	// AlterPassword: in password mode, every expected role that already exists has
+	// its password (re)set, so a secret rotation or a trust->password switch keeps
+	// all roles in sync. New roles get their password in the CREATE.
+	if in.Password != nil {
+		for name := range expectedNames {
+			if existingSet[name] {
+				plan.AlterPassword = append(plan.AlterPassword, name)
+			}
+		}
+	}
+
 	sort.Strings(plan.Create)
 	sort.Strings(plan.GrantReader)
 	sort.Strings(plan.Drop)
+	sort.Strings(plan.AlterPassword)
 
-	plan.DDL = buildDDL(in.ReaderRole, plan)
+	plan.DDL = buildDDL(in, plan)
 	return plan, nil
 }
 
@@ -173,18 +194,29 @@ func hasManagedPrefix(name, prefix string) bool {
 }
 
 // buildDDL renders the ordered statement list for a plan: all CREATE ROLE
-// statements, then all GRANT statements, then all DROP ROLE statements last, so
-// a created role is granted before any drop runs. Every identifier is quoted
-// with pq.QuoteIdentifier.
-func buildDDL(readerRole string, plan Plan) []string {
-	ddl := make([]string, 0, len(plan.Create)+len(plan.GrantReader)+len(plan.Drop))
+// statements, then password alters, then all GRANT statements, then all DROP
+// ROLE statements last, so a created role is granted before any drop runs. Every
+// identifier is quoted with pq.QuoteIdentifier and every password with
+// pq.QuoteLiteral. When in.Password is non-nil, CREATE statements include a
+// PASSWORD clause and existing roles get an ALTER ROLE ... PASSWORD.
+func buildDDL(in Inputs, plan Plan) []string {
+	ddl := make([]string, 0, len(plan.Create)+len(plan.AlterPassword)+len(plan.GrantReader)+len(plan.Drop))
 	for _, role := range plan.Create {
-		ddl = append(ddl, fmt.Sprintf(
-			"CREATE ROLE %s LOGIN NOSUPERUSER NOCREATEROLE INHERIT;",
-			pq.QuoteIdentifier(role),
-		))
+		stmt := fmt.Sprintf("CREATE ROLE %s LOGIN NOSUPERUSER NOCREATEROLE INHERIT", pq.QuoteIdentifier(role))
+		if in.Password != nil {
+			stmt += " PASSWORD " + pq.QuoteLiteral(in.Password(role))
+		}
+		ddl = append(ddl, stmt+";")
 	}
-	reader := pq.QuoteIdentifier(readerRole)
+	if in.Password != nil {
+		for _, role := range plan.AlterPassword {
+			ddl = append(ddl, fmt.Sprintf(
+				"ALTER ROLE %s PASSWORD %s;",
+				pq.QuoteIdentifier(role), pq.QuoteLiteral(in.Password(role)),
+			))
+		}
+	}
+	reader := pq.QuoteIdentifier(in.ReaderRole)
 	for _, role := range plan.GrantReader {
 		ddl = append(ddl, fmt.Sprintf(
 			"GRANT %s TO %s;",

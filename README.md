@@ -59,7 +59,6 @@ conn_max_lifetime_ms = 300000
 auth_table_prefix           = "pathql_auth_"
 session_variable            = "app.user"
 read_only                   = true
-block_multiple_statements   = true
 metrics_user                = "metrics"
 startup_checks              = "warn"
 # trusted_proxies = ["10.0.0.0/8", "192.168.0.0/16"]
@@ -113,8 +112,8 @@ Section options:
 
 - **`[database]`**: connection-pool caps for the single shared pool
   (`max_open_conns`, `max_idle_conns`, `conn_max_lifetime_ms`).
-- **`[security]`**: see [Row-level security](#row-level-security) and
-  [Multiple statements](#multiple-statements). `auth_table_prefix` namespaces
+- **`[security]`**: see [Row-level security](#row-level-security).
+  `auth_table_prefix` namespaces
   the auth tables. `metrics_user` is the principal allowed to read `/metrics`
   (see [Metrics](#metrics)). `startup_checks` controls the
   [startup hardening check](#startup-hardening-checks). `trusted_proxies` is a
@@ -270,9 +269,20 @@ security:
 - **`reader_role`**: a group role granting read access that every managed role is
   a member of (default `pathql_readers`). Managed roles are never members of each
   other.
+- **`auth`**: how the per-role connections authenticate. `trust` (default) relies
+  on trust/peer on an isolated channel and stores no secret. `password` derives
+  each role's password as `HMAC(password_secret, role)`, includes it in the sync
+  DDL (`CREATE ROLE ... PASSWORD`), and re-derives it at connect time, so no
+  per-role secret is stored; pair it with `scram-sha-256` in `pg_hba.conf` for
+  production. `password_secret` is required for `password` and is `${ENV}`-expandable;
+  the `baseline_role` must also have that derived password set.
 - **`[database] max_total_backends`** caps total connections across all per-role
   pools (a shared semaphore); **`warm_pool_limit`** bounds how many pools keep
   idle connections. Both are config only.
+
+  Client-cert + `pg_ident` is intentionally not used for per-role auth: with one
+  server cert it would require enumerating a `pg_ident` line per role and
+  reloading on every role creation, which does not fit dynamically managed roles.
 
 The server never runs role DDL and never holds `CREATEROLE`. `GET /admin/roles/sync`
 emits the exact `CREATE ROLE` / `GRANT` / `DROP ROLE` statements needed to make

@@ -21,8 +21,9 @@ var authPrefixRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 // against ^[A-Za-z_][A-Za-z0-9_]*$ before being interpolated into the users
 // table name; every other value is bound. managedPrefix is the managed-role
 // prefix and readerRole is the shared read group, both passed through to
-// Compute.
-func LoadAndCompute(ctx context.Context, db *sqlx.DB, authPrefix, managedPrefix, readerRole string) (Plan, error) {
+// Compute. password is passed through to Inputs.Password (nil for trust auth,
+// non-nil to make the DDL set each role's login password).
+func LoadAndCompute(ctx context.Context, db *sqlx.DB, authPrefix, managedPrefix, readerRole string, password func(role string) string) (Plan, error) {
 	if !authPrefixRe.MatchString(authPrefix) {
 		return Plan{}, fmt.Errorf("roles: invalid auth prefix %q: must match %s", authPrefix, authPrefixRe.String())
 	}
@@ -70,5 +71,6 @@ func LoadAndCompute(ctx context.Context, db *sqlx.DB, authPrefix, managedPrefix,
 		ExistingRoles:   existingRoles,
 		ExpectedUserIDs: expectedUserIDs,
 		ReaderMembers:   readerMembers,
+		Password:        password,
 	})
 }
