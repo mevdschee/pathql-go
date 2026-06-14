@@ -70,3 +70,24 @@ CREATE TABLE pathql_auth_api_keys (
 -- compute sha-256 in the application and pass the 32-byte digest as a bound
 -- bytea parameter. Set expires_at to limit the key's lifetime; NULL never
 -- expires.
+
+-- ---------------------------------------------------------------------------
+-- login_role pool tuning (only needed when security.identity_kind = "login_role")
+-- ---------------------------------------------------------------------------
+-- Per-user connection-pool overrides, set via PUT /admin/users/{id}/pool. NULL
+-- means inherit the global default.
+ALTER TABLE pathql_auth_users
+  ADD COLUMN IF NOT EXISTS pool_max_open              int,
+  ADD COLUMN IF NOT EXISTS pool_max_idle              int,
+  ADD COLUMN IF NOT EXISTS pool_conn_max_lifetime_ms  bigint,
+  ADD COLUMN IF NOT EXISTS pool_conn_max_idle_time_ms bigint;
+
+-- Global pool defaults, runtime-tunable via PUT /admin/pool. A single row keyed
+-- on id = 1; seeded from config.ini on first start if absent.
+CREATE TABLE IF NOT EXISTS pathql_auth_pool_settings (
+  id                    smallint PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+  max_open              int    NOT NULL,
+  max_idle              int    NOT NULL,
+  conn_max_lifetime_ms  bigint NOT NULL,
+  conn_max_idle_time_ms bigint NOT NULL
+);

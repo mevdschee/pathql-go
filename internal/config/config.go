@@ -15,9 +15,9 @@ import (
 
 // Config is the top-level server configuration.
 type Config struct {
-	Driver  string `toml:"driver"`  // required
-	DSN     string `toml:"dsn"`     // required; supports ${ENV} expansion
-	Listen  string `toml:"listen"`  // default ":8000"
+	Driver  string `toml:"driver"` // required
+	DSN     string `toml:"dsn"`    // required; supports ${ENV} expansion
+	Listen  string `toml:"listen"` // default ":8000"
 	Verbose bool   `toml:"verbose"`
 
 	Database Database `toml:"database"`
@@ -339,7 +339,7 @@ func (c *Config) validate() error {
 	if c.Driver == "" {
 		return fmt.Errorf("config: driver is required")
 	}
-	if c.DSN == "" {
+	if c.Security.IdentityKind != "login_role" && c.DSN == "" {
 		return fmt.Errorf("config: dsn is required (empty after env expansion)")
 	}
 
@@ -377,6 +377,9 @@ func (c *Config) validate() error {
 	case "session_guc":
 		// the default GUC binding; no extra requirements
 	case "login_role":
+		if len(c.Auth.Methods) == 0 {
+			return fmt.Errorf("config: identity_kind login_role requires at least one auth method (it needs a principal to pick a role)")
+		}
 		if c.Roles.BaseDSN == "" {
 			return fmt.Errorf("config: identity_kind login_role requires roles.base_dsn (empty after env expansion)")
 		}

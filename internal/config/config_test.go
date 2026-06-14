@@ -144,6 +144,54 @@ func TestLoad_Defaults(t *testing.T) {
 	}
 }
 
+func TestLoad_LoginRoleValidation(t *testing.T) {
+	valid := `
+driver = "postgres"
+
+[security]
+identity_kind = "login_role"
+
+[auth]
+methods = ["apikey"]
+
+[roles]
+base_dsn = "host=localhost dbname=pathql sslmode=disable"
+`
+	cfg, err := Load(writeTemp(t, valid))
+	if err != nil {
+		t.Fatalf("valid login_role config errored: %v", err)
+	}
+	if cfg.Security.IdentityKind != "login_role" {
+		t.Errorf("IdentityKind = %q, want login_role", cfg.Security.IdentityKind)
+	}
+
+	cases := []struct{ name, content, wantMsg string }{
+		{
+			name:    "login_role missing base_dsn",
+			content: "driver=\"postgres\"\n[security]\nidentity_kind=\"login_role\"\n[auth]\nmethods=[\"apikey\"]\n",
+			wantMsg: "base_dsn",
+		},
+		{
+			name:    "login_role without auth methods",
+			content: "driver=\"postgres\"\n[security]\nidentity_kind=\"login_role\"\n[roles]\nbase_dsn=\"host=localhost dbname=pathql\"\n",
+			wantMsg: "auth method",
+		},
+		{
+			name:    "unknown identity_kind",
+			content: "driver=\"postgres\"\ndsn=\"host=localhost dbname=pathql\"\n[security]\nidentity_kind=\"bogus\"\n",
+			wantMsg: "identity_kind",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(writeTemp(t, tc.content))
+			if err == nil || !strings.Contains(err.Error(), tc.wantMsg) {
+				t.Errorf("got %v, want error containing %q", err, tc.wantMsg)
+			}
+		})
+	}
+}
+
 func TestLoad_EnvExpansion(t *testing.T) {
 	t.Setenv("PATHQL_DB_PASSWORD", "s3cr3t")
 	content := `

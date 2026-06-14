@@ -1,0 +1,55 @@
+name: pathql-login-role
+
+# A self-contained demo of the login_role identity model: each user maps to its
+# own PostgreSQL role, the server connects AS that role, and RLS keys on
+# current_user, which a query cannot forge. Run it with:
+#
+#   cd examples/login-role
+#   docker compose up --build
+#
+# Then follow the walkthrough in README.md. Tear down (including the database
+# volume) with: docker compose down -v
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: pathql
+      # trust auth lets the server connect as any role with no password. This is
+      # ONLY safe because the database is reachable solely over the isolated
+      # compose network; nothing here is exposed to untrusted clients. Never use
+      # trust on a network that anyone untrusted can reach.
+      POSTGRES_HOST_AUTH_METHOD: trust
+    # initdb scripts run once, in filename order, on first boot only.
+    volumes:
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    # Published on 5434 to avoid colliding with a Postgres already on the host's
+    # 5432 (and with the sibling demo on 5433). The server reaches the database
+    # over the compose network, not this port; it only lets you psql in from the
+    # host:
+    #   psql -h localhost -p 5434 -U postgres pathql
+    ports:
+      - "5434:5432"
+    healthcheck:
+      # Force a TCP check so it only reports healthy after the real startup, not
+      # during the socket-only initdb phase. The server waits for this.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d pathql"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  server:
+    # Reuse the sibling demo's Dockerfile; build context is the repo root.
+    build:
+      context: ../..
+      dockerfile: examples/demo/Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    # No DB password env is needed: each per-role connection authenticates by
+    # trust over the compose network.
+    volumes:
+      - ./config.ini:/app/config.ini:ro
+    ports:
+      - "8000:8000"   # POST /pathql, GET /metrics, and the /admin/* routes

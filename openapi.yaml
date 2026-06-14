@@ -286,6 +286,138 @@ paths:
                 type: "Error"
                 message: "forbidden"
 
+  /admin/users:
+    post:
+      summary: Create a user
+      description: |
+        Creates a user row (optionally with a bcrypt password for Basic and a
+        freshly generated API key, returned once) and reports the managed login
+        role the next roles sync will create. Authorized only for the configured
+        `admin_user` principal.
+      operationId: adminCreateUser
+      tags: [Admin]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username]
+              properties:
+                username: { type: string }
+                app_user: { type: string, description: "RLS identity; defaults to username" }
+                password: { type: string, description: "enables HTTP Basic when set" }
+                generate_api_key: { type: boolean }
+      responses:
+        "201":
+          description: User created
+          content:
+            application/json:
+              example: { id: 2, role: "pathql_r_2", api_key: "de950e66...", note: "role is created on the next roles sync" }
+        "400": { description: "Invalid body or duplicate username" }
+        "401": { description: "Missing or invalid credentials" }
+        "403": { description: "Not the admin principal" }
+
+  /admin/users/{id}:
+    delete:
+      summary: Delete a user
+      description: Removes the user and its API keys and evicts the role's pool; the role is dropped by the next roles sync. Admin only.
+      operationId: adminDeleteUser
+      tags: [Admin]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200": { description: "Deleted", content: { application/json: { example: { deleted: true, role: "pathql_r_2", note: "run the roles sync to drop the role" } } } }
+        "401": { description: "Missing or invalid credentials" }
+        "403": { description: "Not the admin principal" }
+        "404": { description: "No such user" }
+
+  /admin/roles/sync:
+    get:
+      summary: Role-sync DDL
+      description: |
+        Returns the exact DDL to make the database login roles match the users
+        table (the server never runs it; a cron job applies it). login_role only.
+        Admin only.
+      operationId: adminRolesSync
+      tags: [Admin]
+      responses:
+        "200":
+          description: The sync plan
+          content:
+            application/json:
+              example:
+                create: ["pathql_r_2", "pathql_r_3"]
+                grant_reader: ["pathql_r_2", "pathql_r_3"]
+                drop: []
+                ddl: ["CREATE ROLE \"pathql_r_2\" LOGIN NOSUPERUSER NOCREATEROLE INHERIT;", "GRANT \"pathql_readers\" TO \"pathql_r_2\";"]
+        "401": { description: "Missing or invalid credentials" }
+        "403": { description: "Not the admin principal" }
+
+  /admin/pool:
+    get:
+      summary: Read pool settings and stats
+      description: The effective global pool defaults, the config-only ceilings, and live per-pool stats. login_role only. Admin only.
+      operationId: adminGetPool
+      tags: [Admin]
+      responses:
+        "200":
+          description: Pool settings and stats
+          content:
+            application/json:
+              example:
+                global: { max_open: 50, max_idle: 10, conn_max_lifetime_ms: 300000, conn_max_idle_time_ms: 60000 }
+                max_total_backends: 200
+                warm_pool_limit: 64
+                pools: { "pathql_r_2": { max_open_connections: 50, open_connections: 2, in_use: 0, idle: 2, wait_count: 0, wait_duration_ms: 0 } }
+        "400": { description: "Not in login_role mode" }
+        "401": { description: "Missing or invalid credentials" }
+        "403": { description: "Not the admin principal" }
+    put:
+      summary: Set global pool defaults
+      description: Persists the global pool defaults and applies them live to every pool without an override. login_role only. Admin only.
+      operationId: adminPutPool
+      tags: [Admin]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PoolParams" }
+      responses:
+        "200": { description: "Applied", content: { application/json: { example: { global: { max_open: 7, max_idle: 2, conn_max_lifetime_ms: 120000, conn_max_idle_time_ms: 30000 } } } } }
+        "400": { description: "Invalid params (e.g. max_open over max_total_backends) or not login_role" }
+        "401": { description: "Missing or invalid credentials" }
+        "403": { description: "Not the admin principal" }
+
+  /admin/users/{id}/pool:
+    put:
+      summary: Set a per-user pool override
+      operationId: adminPutUserPool
+      tags: [Admin]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PoolParams" }
+      responses:
+        "200": { description: "Override set" }
+        "400": { description: "Invalid params or not login_role" }
+        "401": { description: "Missing or invalid credentials" }
+        "403": { description: "Not the admin principal" }
+    delete:
+      summary: Clear a per-user pool override
+      operationId: adminDeleteUserPool
+      tags: [Admin]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200": { description: "Override cleared" }
+        "400": { description: "Not in login_role mode" }
+        "401": { description: "Missing or invalid credentials" }
+        "403": { description: "Not the admin principal" }
+
 components:
   securitySchemes:
     ApiKeyHeader:
@@ -377,8 +509,19 @@ components:
             are never included; they are logged server-side only.
           example: "internal error"
 
+    PoolParams:
+      type: object
+      description: Connection-pool parameters (durations in milliseconds).
+      properties:
+        max_open: { type: integer }
+        max_idle: { type: integer }
+        conn_max_lifetime_ms: { type: integer, format: int64 }
+        conn_max_idle_time_ms: { type: integer, format: int64 }
+
 tags:
   - name: Query Execution
     description: Endpoints for executing SQL queries
   - name: Metrics
     description: Operational metrics, restricted to the metrics principal
+  - name: Admin
+    description: User and role management, restricted to the admin principal

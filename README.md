@@ -238,6 +238,67 @@ grants for the application role, is in
 The session variable name must be schema-qualified (contain a dot) and is
 validated before use. When no identity is present, no session variable is set.
 
+## Identity model (session_guc vs login_role)
+
+`[security] identity_kind` selects how the caller's identity reaches row-level
+security:
+
+- **`session_guc`** (default): the server binds the authenticated identity with
+  `set_config('app.user', ..., true)` and policies read `current_setting('app.user', true)`,
+  as described above. One shared pool serves every request. The GUC is only as
+  trustworthy as the query, though: a caller running arbitrary SQL can
+  `set_config('app.user', ...)` to another value, so this mode leans on
+  `block_multiple_statements` and suits single-tenant or trusted-caller setups.
+- **`login_role`**: the server connects to PostgreSQL **as the caller's own
+  database role** and policies read `current_user`. Because the role is fixed by
+  authentication and the role system enforces membership, a query cannot forge
+  another identity, even in a single statement. This is the robust choice for
+  multi-tenant RLS. See [examples/login-role](examples/login-role/) for a runnable
+  setup and [ROLE_MANAGEMENT_PLAN.md](ROLE_MANAGEMENT_PLAN.md) for the design.
+
+### login_role configuration
+
+`login_role` is configured under `[roles]` and needs at least one auth method:
+
+- **`base_dsn`**: the connection string **without** a user; the server appends
+  `user=<role>` per connection. Authentication is trust/peer on an isolated
+  channel (or client cert + `pg_ident`), so no per-user password is stored.
+- **`baseline_role`**: the role used for pre-auth work (reading the auth tables)
+  before the caller is known. Default `pathql_auth`.
+- **`prefix`**: a user with id N maps to the login role `<prefix>N`
+  (default `pathql_r_`); the role name is derived from the id.
+- **`reader_role`**: a group role granting read access that every managed role is
+  a member of (default `pathql_readers`). Managed roles are never members of each
+  other.
+- **`[database] max_total_backends`** caps total connections across all per-role
+  pools (a shared semaphore); **`warm_pool_limit`** bounds how many pools keep
+  idle connections. Both are config only.
+
+The server never runs role DDL and never holds `CREATEROLE`. `GET /admin/roles/sync`
+emits the exact `CREATE ROLE` / `GRANT` / `DROP ROLE` statements needed to make
+the database roles match the users table; an operator or cron job applies them.
+
+## Admin routes
+
+When `[security] admin_user` is set, the server serves `/admin/*` on the main
+listener, authorized only for that principal (which may do nothing else: it is
+refused on `/pathql` and `/metrics`). An empty `admin_user` disables the routes
+(fail closed). Admin requests authenticate like any other, are rate-limited, and
+are audit-logged.
+
+- **`POST /admin/users`** `{username, app_user?, password?, generate_api_key?}`:
+  creates a user (optionally with a bcrypt password for Basic and a freshly
+  generated API key, returned once) and reports the managed role name the next
+  sync will create.
+- **`DELETE /admin/users/{id}`**: removes the user and its API keys and evicts the
+  role's pool; the role is dropped by the next sync.
+- **`GET /admin/roles/sync`**: returns the role-sync DDL (`create`, `grant_reader`,
+  `drop`, and the ordered `ddl`) for a cron job to apply. login_role only.
+- **`GET`/`PUT /admin/pool`**: read or set the global pool defaults (persisted,
+  applied live), with per-pool `db.Stats`. login_role only.
+- **`PUT`/`DELETE /admin/users/{id}/pool`**: set or clear a per-user pool
+  override. login_role only.
+
 ## Multiple statements
 
 With `block_multiple_statements = true` (the default), a query that contains more

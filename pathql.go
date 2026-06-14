@@ -24,14 +24,20 @@ import (
 	"github.com/mevdschee/pathql-go/internal/config"
 	"github.com/mevdschee/pathql-go/internal/db"
 	"github.com/mevdschee/pathql-go/internal/middleware"
+	"github.com/mevdschee/pathql-go/internal/roles"
 )
 
 // cfg holds the loaded server configuration.
 var cfg *config.Config
 
-// pool is the single shared connection pool opened at startup and reused for
-// every request. It replaces the previous per-request pathsqlx.Connect.
+// pool is the shared connection pool. In session_guc mode it serves every query;
+// in login_role mode it is the baseline connection (authenticated as
+// roles.baseline_role) used for auth-table lookups and catalog reads.
 var pool *pathsqlx.DB
+
+// rolePools is the per-role connection manager, non-nil only in login_role mode.
+// Each query runs on a connection authenticated as the caller's own role.
+var rolePools *db.RolePools
 
 // sharedCache is the abuse-protection / JWKS cache built at startup and shared
 // by the rate limiter and the JWT authenticator. It is closed on shutdown.
@@ -413,14 +419,13 @@ func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Resolve the authenticated principal (nil-safe: AppUser "" when there is no
-	// principal, e.g. auth disabled), then run the query under row-level security
-	// with a Go-side timeout matching the DB statement timeout (defense in depth).
+	// Resolve the authenticated principal (nil when auth is disabled).
+	var principal *auth.Principal
 	appUser := ""
 	if p, ok := auth.FromContext(req.Context()); ok && p != nil {
+		principal = p
 		appUser = p.AppUser
-		// Audit: the request already passed the auth chain to carry a principal.
-		// Log the authenticated identity with the request id for correlation.
+		// Audit: log the authenticated identity with the request id for correlation.
 		log.Printf("pathql: request %s: authenticated app_user=%q user_id=%d", requestID(req, w), p.AppUser, p.UserID)
 		// Attribute the request-handling time to this identity for the top_users
 		// metric. Same total-handler-time basis as the top_queries record above.
@@ -433,14 +438,44 @@ func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
 	ctx, cancel := context.WithTimeout(req.Context(), statementTimeout)
 	defer cancel()
 
-	response, err := db.RunQuery(ctx, pool, request.Query, params, paths, db.QueryOptions{
-		AppUser:          appUser,
-		SessionVariable:  cfg.Security.SessionVariable,
+	// Select the connection and identity binding by identity model.
+	queryPool := pool
+	opts := db.QueryOptions{
 		ReadOnly:         cfg.Security.ReadOnly,
 		StatementTimeout: statementTimeout,
 		IdleInTxTimeout:  statementTimeout,
 		WorkMemKB:        cfg.Limits.WorkMemKB,
-	})
+	}
+	if cfg.Security.IdentityKind == "login_role" {
+		// Identity is current_user: run on a connection authenticated as the
+		// caller's own database role, with no app.user binding.
+		if principal == nil {
+			writeError(w, req, http.StatusUnauthorized, "authentication required", nil)
+			return
+		}
+		role, nameErr := roles.RoleName(cfg.Roles.Prefix, principal.UserID)
+		if nameErr != nil {
+			writeError(w, req, http.StatusInternalServerError, genericInternalError, nameErr)
+			return
+		}
+		rp, release, acqErr := rolePools.Acquire(ctx, role)
+		if acqErr != nil {
+			if errors.Is(acqErr, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				writeError(w, req, http.StatusServiceUnavailable, "server busy", acqErr)
+				return
+			}
+			writeError(w, req, http.StatusInternalServerError, genericInternalError, acqErr)
+			return
+		}
+		defer release()
+		queryPool = rp
+	} else {
+		// session_guc: bind app.user via set_config; policies read current_setting.
+		opts.AppUser = appUser
+		opts.SessionVariable = cfg.Security.SessionVariable
+	}
+
+	response, err := db.RunQuery(ctx, queryPool, request.Query, params, paths, opts)
 	if err != nil {
 		// A timeout (Go-side or DB-side) is reported as 503 server-busy; any other
 		// driver/query error is a generic 500. The real cause is logged
@@ -527,10 +562,11 @@ func principalKey(r *http.Request) string {
 func publicHandler(c *config.Config, chain *auth.Chain, theCache cache.Cache, trustedProxies []*net.IPNet) http.Handler {
 	var h http.Handler = http.HandlerFunc(PathQlEndpoint)
 	h = middleware.PerUserConcurrency(c.Limits.MaxConcurrentPerUser, principalKey)(h)
-	// The metrics-only principal may read metrics and nothing else: keep it off
-	// /pathql. Runs after auth (so the principal is resolved) and before the
-	// per-user slot is taken.
+	// The metrics-only and admin-only principals may use only their own
+	// endpoints: keep them off /pathql. Runs after auth (so the principal is
+	// resolved) and before the per-user slot is taken.
 	h = denyAppUser(c.Security.MetricsUser)(h)
+	h = denyAppUser(c.Security.AdminUser)(h)
 	if chain != nil {
 		h = chain.Middleware(h)
 	}
@@ -652,9 +688,29 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// Open the database pools. In session_guc mode a single shared pool serves
+	// every request. In login_role mode `pool` is the baseline connection
+	// (authenticated as roles.baseline_role) for auth lookups and catalog reads,
+	// and rolePools serves queries on per-role connections.
+	baseDSN := cfg.DSN
+	if cfg.Security.IdentityKind == "login_role" {
+		baseDSN = cfg.Roles.BaseDSN + " user=" + cfg.Roles.BaselineRole
+		defaults := db.PoolParams{
+			MaxOpen:         cfg.Database.MaxOpenConns,
+			MaxIdle:         cfg.Database.MaxIdleConns,
+			ConnMaxLifetime: time.Duration(cfg.Database.ConnMaxLifetimeMs) * time.Millisecond,
+			ConnMaxIdleTime: time.Duration(cfg.Database.ConnMaxIdleTimeMs) * time.Millisecond,
+		}
+		rolePools, err = db.NewRolePools(cfg.Driver, cfg.Roles.BaseDSN, cfg.Database.MaxTotalBackends, cfg.Roles.WarmPoolLimit, defaults)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer rolePools.Close()
+		log.Printf("identity model: login_role (per-role connections, current_user RLS)")
+	}
 	pool, err = db.OpenPool(
 		cfg.Driver,
-		cfg.DSN,
+		baseDSN,
 		cfg.Database.MaxOpenConns,
 		cfg.Database.MaxIdleConns,
 		time.Duration(cfg.Database.ConnMaxLifetimeMs)*time.Millisecond,
@@ -663,6 +719,22 @@ func main() {
 		log.Fatal(err)
 	}
 	defer db.Close(pool)
+
+	// Admin-side user CRUD over the auth tables (gated to admin_user on /admin/*).
+	userAdmin, err = auth.NewUserAdmin(pool.DB, cfg.Security.AuthTablePrefix)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Runtime pool settings persistence, and apply the stored defaults/overrides
+	// to the live pools (login_role mode only).
+	if rolePools != nil {
+		poolStore, err = db.NewPoolStore(pool.DB, cfg.Security.AuthTablePrefix)
+		if err != nil {
+			log.Fatal(err)
+		}
+		loadPoolSettings()
+	}
 
 	// Lazy startup: warn but keep going if the database is unreachable now.
 	pingCtx, cancelPing := context.WithTimeout(context.Background(), 5*time.Second)
@@ -693,6 +765,13 @@ func main() {
 	router.Handle("POST /pathql", pathqlH)
 	router.Handle("OPTIONS /pathql", pathqlH)
 	router.Handle("GET /metrics", metricsHandler(cfg, chain, sharedCache, trustedProxies))
+	router.Handle("POST /admin/users", adminHandler(cfg, chain, sharedCache, trustedProxies, adminAddUser))
+	router.Handle("DELETE /admin/users/{id}", adminHandler(cfg, chain, sharedCache, trustedProxies, adminDeleteUser))
+	router.Handle("GET /admin/roles/sync", adminHandler(cfg, chain, sharedCache, trustedProxies, adminRolesSync))
+	router.Handle("GET /admin/pool", adminHandler(cfg, chain, sharedCache, trustedProxies, adminGetPool))
+	router.Handle("PUT /admin/pool", adminHandler(cfg, chain, sharedCache, trustedProxies, adminPutPool))
+	router.Handle("PUT /admin/users/{id}/pool", adminHandler(cfg, chain, sharedCache, trustedProxies, adminPutUserPool))
+	router.Handle("DELETE /admin/users/{id}/pool", adminHandler(cfg, chain, sharedCache, trustedProxies, adminDeleteUserPool))
 
 	readTimeout := time.Duration(cfg.Timeouts.ReadMs) * time.Millisecond
 	writeTimeout := time.Duration(cfg.Timeouts.WriteMs) * time.Millisecond
