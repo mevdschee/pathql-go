@@ -243,8 +243,12 @@ at startup when it does.
 Failed authentication returns `401` with a generic body and a
 `WWW-Authenticate` header. The response never reveals which field was wrong.
 
-Once a request authenticates, the resolved `app_user` is bound to the Postgres
-session for the query, see [Row-level security](#row-level-security).
+Once a request authenticates, the resolved `app_user` is the principal name used
+for audit logging, metrics, per-user rate limiting, and the `metrics_user` /
+`admin_user` route checks. It is not the row-level-security identity: in
+`login_role` mode RLS keys on the caller's own database role (`current_user`),
+which is derived from the user id, not from `app_user`. See
+[Row-level security](#row-level-security).
 
 ### JWT
 
