@@ -605,8 +605,9 @@ When writes are on, each request is classified by its leading statement keyword:
   stacked statements, system-catalog access) is rejected with `400`.
 
 Classification applies the same structural rules as the [SQL gate](#sql-gate) (a
-single statement over non-catalog objects) regardless of the `sql_gate` setting,
-so admitting writes never also admits stacked statements or catalog access.
+single statement over non-catalog objects) no matter how `sql_gate` is set.
+Enabling writes therefore has no side effects: stacked statements and catalog
+access stay blocked either way.
 
 ### Response shape
 
