@@ -403,10 +403,27 @@ func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	// Optional SQL gate: when enabled, reject queries outside the read-only,
-	// single-statement, no-system-catalog policy before any database work. The
+	// Classify the statement and decide read vs write. When writes are disabled
+	// (the default) the optional SQL gate is the only statement validator and
+	// every query runs read-only. When writes are enabled, Classify routes the
+	// request: it applies the gate's structural rules (single statement, no system
+	// catalogs) itself and additionally distinguishes a read from a write, so a
+	// write reaches the read-write path while reads stay read-only. Either way the
 	// rejection reason describes the request shape, so it is safe to return.
-	if err := sqlgate.Check(request.Query, sqlgate.Mode(cfg.Security.SQLGate)); err != nil {
+	writesEnabled := cfg.WritesEnabled()
+	var class sqlgate.Class
+	var hasReturning bool
+	if writesEnabled {
+		c, cerr := sqlgate.Classify(request.Query)
+		if cerr != nil {
+			writeError(w, req, http.StatusBadRequest, cerr.Error(), cerr)
+			return
+		}
+		class = c
+		if class == sqlgate.ClassWrite {
+			hasReturning = sqlgate.HasReturning(request.Query)
+		}
+	} else if err := sqlgate.Check(request.Query, sqlgate.Mode(cfg.Security.SQLGate)); err != nil {
 		writeError(w, req, http.StatusBadRequest, err.Error(), err)
 		return
 	}
@@ -454,6 +471,8 @@ func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
 		opts.MaxEstimatedCost = cfg.Limits.MaxEstimatedCost
 		opts.MaxEstimatedRows = cfg.Limits.MaxEstimatedRows
 	}
+	// Write blast-radius cap (driver-agnostic); only consulted on the write path.
+	opts.MaxAffectedRows = cfg.Limits.MaxAffectedRows
 
 	// Select the connection by identity model. With identity_kind "none" the
 	// shared pool serves every query and there is no per-caller RLS binding. With
@@ -465,7 +484,21 @@ func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
 	}
 	defer release()
 
-	response, err := db.RunQuery(ctx, queryPool, request.Query, params, paths, opts)
+	// Route by class. A write runs in a read-write transaction (RunWrite); a read
+	// always runs READ ONLY. When writes are enabled the top-level read_only is
+	// false (validation forbids combining it with writes = on), so force the read
+	// path read-only here - enabling writes must never relax the read path.
+	var response interface{}
+	var err error
+	if writesEnabled && class == sqlgate.ClassWrite {
+		response, err = db.RunWrite(ctx, queryPool, request.Query, params, paths, opts, hasReturning)
+	} else {
+		readOpts := opts
+		if writesEnabled {
+			readOpts.ReadOnly = true
+		}
+		response, err = db.RunQuery(ctx, queryPool, request.Query, params, paths, readOpts)
+	}
 	if err != nil {
 		// A timeout (Go-side or DB-side) is reported as 503 server-busy; any other
 		// driver/query error is a generic 500. The real cause is logged
@@ -479,6 +512,12 @@ func PathQlEndpoint(w http.ResponseWriter, req *http.Request) {
 		// wrapped cause, not returned, so data volume is not disclosed).
 		if errors.Is(err, db.ErrQueryTooExpensive) {
 			writeError(w, req, http.StatusBadRequest, "query rejected: estimated cost or row count exceeds the configured limit", err)
+			return
+		}
+		// Write blast-radius cap: the write was rolled back before commit. Generic
+		// message; the actual count is logged via the wrapped cause, not returned.
+		if errors.Is(err, db.ErrTooManyRowsAffected) {
+			writeError(w, req, http.StatusBadRequest, "write rejected: affected row count exceeds the configured limit", err)
 			return
 		}
 		writeError(w, req, http.StatusInternalServerError, genericInternalError, err)
@@ -790,6 +829,9 @@ func main() {
 	if chain == nil {
 		log.Printf("WARNING: authentication is DISABLED (no auth.methods configured); anyone who can reach %s may run SQL", cfg.Listen)
 	}
+	if cfg.WritesEnabled() && cfg.Security.IdentityKind == "none" {
+		log.Printf("WARNING: writes are ENABLED with identity_kind=none; every caller writes as the same database role with no per-caller row-level authorization (single-tenant only) - use identity_kind=login_role with RLS WITH CHECK policies for multi-tenant writes")
+	}
 
 	// One router on the public listener (net/http ServeMux with method patterns,
 	// Go 1.22+). OPTIONS is registered so a CORS preflight reaches the chain (the
@@ -910,7 +952,10 @@ func runStartupChecks(c *config.Config, pool *pathsqlx.DB) {
 	// is the boundary, so escalate it to critical (aborting under enforce) just
 	// for login_role; in "none" mode the shared role intentionally sees all rows.
 	noRLSIsCritical := c.Security.StartupChecks == "enforce" && c.Security.IdentityKind == "login_role"
-	rep, err := db.VerifyHardening(ctx, pool, c.Driver, c.Security.AuthTablePrefix, noRLSIsCritical)
+	// With writes enabled and RLS the boundary under enforce, a writable table
+	// without a WITH CHECK policy is a silent cross-tenant write path: critical.
+	writeRLSIsCritical := c.Security.StartupChecks == "enforce" && c.Security.IdentityKind == "login_role"
+	rep, err := db.VerifyHardening(ctx, pool, c.Driver, c.Security.AuthTablePrefix, noRLSIsCritical, c.WritesEnabled(), writeRLSIsCritical)
 	if err != nil {
 		log.Printf("WARNING: startup hardening check could not run: %v", err)
 		dbChecked = false

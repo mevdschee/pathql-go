@@ -162,6 +162,52 @@ func TestPathQlEndpointSQLGate(t *testing.T) {
 	}
 }
 
+// TestPathQlEndpointWrites verifies the write routing: with writes on, a
+// disallowed statement type is rejected by the classifier, while a valid write
+// passes classification (and then fails identity resolution, proving it was
+// admitted); with writes off, a write is rejected by the gate as not read-only.
+func TestPathQlEndpointWrites(t *testing.T) {
+	setTestConfig(t)
+
+	// Writes on: a DDL statement is rejected by the classifier with a clean 400,
+	// before any identity or database work.
+	cfg.Security.Writes = "on"
+	cfg.Security.ReadOnly = false
+	rw := httptest.NewRecorder()
+	PathQlEndpoint(rw, httptest.NewRequest(http.MethodPost, "/pathql",
+		strings.NewReader(`{"query":"DROP TABLE posts"}`)))
+	if rw.Code != http.StatusBadRequest {
+		t.Fatalf("writes on, DROP: expected 400, got %d (body %q)", rw.Code, rw.Body.String())
+	}
+	if !strings.Contains(rw.Body.String(), "single read or write") {
+		t.Errorf("writes on, DROP: unexpected body: %q", rw.Body.String())
+	}
+
+	// Writes on: a valid DELETE passes classification, then fails identity
+	// resolution (login_role with no principal) with 401, proving the classifier
+	// admitted it rather than rejecting it at the edge.
+	rw = httptest.NewRecorder()
+	PathQlEndpoint(rw, httptest.NewRequest(http.MethodPost, "/pathql",
+		strings.NewReader(`{"query":"DELETE FROM posts WHERE id = 1"}`)))
+	if rw.Code != http.StatusUnauthorized {
+		t.Errorf("writes on, DELETE: expected 401 (admitted then unauthenticated), got %d (body %q)", rw.Code, rw.Body.String())
+	}
+
+	// Writes off with the gate on: the same DELETE is rejected as not read-only.
+	cfg.Security.Writes = "off"
+	cfg.Security.ReadOnly = true
+	cfg.Security.SQLGate = "on"
+	rw = httptest.NewRecorder()
+	PathQlEndpoint(rw, httptest.NewRequest(http.MethodPost, "/pathql",
+		strings.NewReader(`{"query":"DELETE FROM posts WHERE id = 1"}`)))
+	if rw.Code != http.StatusBadRequest {
+		t.Fatalf("writes off, DELETE: expected 400, got %d (body %q)", rw.Code, rw.Body.String())
+	}
+	if !strings.Contains(rw.Body.String(), "read-only") {
+		t.Errorf("writes off, DELETE: unexpected body: %q", rw.Body.String())
+	}
+}
+
 // TestPathQlEndpointGenericErrorOnDBFailure verifies that when the query runs
 // against an unreachable pool, the client gets a generic 500 body that does NOT
 // contain raw driver text.

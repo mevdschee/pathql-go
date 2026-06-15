@@ -55,14 +55,104 @@ var readStarters = map[string]bool{
 	"values": true,
 }
 
+// writeStarters are the statement-leading keywords classified as data-modifying
+// writes. A WITH query is also treated as a write by Classify (the lightweight
+// tokenizer cannot prove a WITH wraps only reads), but it is not listed here
+// because WITH stays a valid read starter for the read-only gate (readStarters).
+var writeStarters = map[string]bool{
+	"insert": true,
+	"update": true,
+	"delete": true,
+}
+
 // Rejection reasons. They describe the shape of the request, never server
 // internals or data, so they are safe to return to the client verbatim.
 var (
-	errEmpty    = errors.New("query rejected: empty query")
-	errNotRead  = errors.New("query rejected: only read-only SELECT queries are allowed")
-	errMultiple = errors.New("query rejected: multiple statements are not allowed")
-	errCatalog  = errors.New("query rejected: access to system catalogs is not allowed")
+	errEmpty      = errors.New("query rejected: empty query")
+	errNotRead    = errors.New("query rejected: only read-only SELECT queries are allowed")
+	errMultiple   = errors.New("query rejected: multiple statements are not allowed")
+	errCatalog    = errors.New("query rejected: access to system catalogs is not allowed")
+	errNotAllowed = errors.New("query rejected: only a single read or write (INSERT/UPDATE/DELETE) statement is allowed")
 )
+
+// Class is the read/write classification of a single SQL statement, used to pick
+// a READ ONLY or a read-write transaction.
+type Class int
+
+const (
+	// ClassRead is a read-only statement (SELECT/TABLE/VALUES); it runs in a
+	// READ ONLY transaction.
+	ClassRead Class = iota
+	// ClassWrite is a data-modifying statement (INSERT/UPDATE/DELETE) or a WITH
+	// query, which the tokenizer cannot prove is read-only; it runs in a
+	// read-write transaction (where a read-only WITH is still valid).
+	ClassWrite
+)
+
+// Classify reports whether query is a read or a write so the caller can choose
+// the transaction mode and, when writes are enabled, decide which execution path
+// to take. It applies the same structural rules as the gate's ModeOn - a single
+// statement over non-catalog objects - independent of the configured gate mode,
+// so admitting writes never also admits stacked statements or system-catalog
+// access. A statement whose leading keyword is neither a read starter
+// (SELECT/WITH/TABLE/VALUES) nor a write starter (INSERT/UPDATE/DELETE) - DDL,
+// TRUNCATE, COPY, SET, SHOW, EXPLAIN, CALL, DO, ... - is rejected with an error
+// whose message is safe to return to the client.
+func Classify(query string) (Class, error) {
+	toks := tokenize(query)
+
+	// Leading significant token, skipping any leading "(", decides the class.
+	first := 0
+	for first < len(toks) && toks[first].kind == tPunct && toks[first].text == "(" {
+		first++
+	}
+	if first >= len(toks) {
+		return ClassRead, errEmpty
+	}
+	ft := toks[first]
+	if ft.kind != tWord {
+		return ClassRead, errNotAllowed
+	}
+	var class Class
+	switch {
+	case ft.text == "with" || writeStarters[ft.text]:
+		// WITH is classified as a write conservatively (it may wrap a modifying
+		// CTE); a read-only WITH still runs correctly in a read-write transaction.
+		class = ClassWrite
+	case readStarters[ft.text]:
+		class = ClassRead
+	default:
+		return ClassRead, errNotAllowed
+	}
+
+	// Single-statement and no-catalog rules, shared with the gate.
+	for i, t := range toks {
+		switch {
+		case t.kind == tPunct && t.text == ";":
+			if i != len(toks)-1 {
+				return ClassRead, errMultiple
+			}
+		case t.kind == tWord || t.kind == tIdent:
+			if isCatalogIdent(t.text) {
+				return ClassRead, errCatalog
+			}
+		}
+	}
+	return class, nil
+}
+
+// HasReturning reports whether query carries a RETURNING clause, used to decide
+// whether a write returns rows (RETURNING) or an affected-row count. It scans the
+// same token stream as the gate, so a "returning" inside a string literal,
+// comment, or quoted identifier does not count.
+func HasReturning(query string) bool {
+	for _, t := range tokenize(query) {
+		if t.kind == tWord && t.text == "returning" {
+			return true
+		}
+	}
+	return false
+}
 
 // Check validates query under mode. It returns nil when the query is allowed,
 // or an error whose message is safe to surface to the client. ModeOff (and only

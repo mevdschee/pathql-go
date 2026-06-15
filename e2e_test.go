@@ -294,8 +294,15 @@ type e2eResp struct {
 
 func post(t *testing.T, srv *httptest.Server, query string, hdr map[string]string) e2eResp {
 	t.Helper()
-	body, _ := json.Marshal(map[string]any{"query": query})
-	req, err := http.NewRequest(http.MethodPost, srv.URL+"/pathql", strings.NewReader(string(body)))
+	return postBody(t, srv, map[string]any{"query": query}, hdr)
+}
+
+// postBody POSTs an arbitrary request body (query plus optional params/paths) so
+// write tests can send PATH hints and parameters.
+func postBody(t *testing.T, srv *httptest.Server, body map[string]any, hdr map[string]string) e2eResp {
+	t.Helper()
+	raw, _ := json.Marshal(body)
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/pathql", strings.NewReader(string(raw)))
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
@@ -508,6 +515,122 @@ func TestE2ERateLimitAndMetrics(t *testing.T) {
 	if _, ok := m["auth"]; !ok {
 		t.Errorf("metrics missing auth counters: %s", mrec.Body.String())
 	}
+}
+
+// TestE2EWrites exercises write support end to end against a live PostgreSQL:
+// it grants the reader role write access on the demo table, adds RLS WITH CHECK
+// policies, enables writes, then asserts that an INSERT ... RETURNING returns the
+// new row, a write without RETURNING returns an affected count, a cross-tenant
+// write is blocked by WITH CHECK, and an over-cap write is rolled back.
+func TestE2EWrites(t *testing.T) {
+	env := setupE2E(t)
+
+	docs := env.docsTable
+	reader := cfg.Roles.ReaderRole
+	bg := context.Background()
+	exec := func(q string) {
+		t.Helper()
+		if _, err := env.pool.DB.ExecContext(bg, q); err != nil {
+			t.Fatalf("setup exec failed: %v\nSQL: %s", err, q)
+		}
+	}
+
+	// Grant writes to the reader group and default owner to the connected role so
+	// the client never has to send it. Then add the per-command WITH CHECK
+	// policies that constrain which rows a caller may create or change.
+	exec(fmt.Sprintf(`GRANT INSERT, UPDATE, DELETE ON %s TO %s`, docs, reader))
+	exec(fmt.Sprintf(`ALTER TABLE %s ALTER COLUMN owner SET DEFAULT current_user`, docs))
+	exec(fmt.Sprintf(`CREATE POLICY %s_ins ON %s FOR INSERT TO %s WITH CHECK (owner = current_user)`, docs, docs, reader))
+	exec(fmt.Sprintf(`CREATE POLICY %s_upd ON %s FOR UPDATE TO %s USING (owner = current_user) WITH CHECK (owner = current_user)`, docs, docs, reader))
+	exec(fmt.Sprintf(`CREATE POLICY %s_del ON %s FOR DELETE TO %s USING (owner = current_user)`, docs, docs, reader))
+
+	cfg.Security.Writes = "on"
+	cfg.Security.ReadOnly = false
+
+	srv := serveE2E(t)
+	defer srv.Close()
+
+	hdr := map[string]string{"X-API-Key": e2eAPIKeyAlice}
+
+	t.Run("insert returning the new row", func(t *testing.T) {
+		r := postBody(t, srv, map[string]any{
+			"query": fmt.Sprintf("INSERT INTO %s (id, body) VALUES (100, 'alice-new') RETURNING id, owner, body", docs),
+			"paths": map[string]string{"$": "$"},
+		}, hdr)
+		if r.status != http.StatusOK {
+			t.Fatalf("status=%d body=%s", r.status, r.body)
+		}
+		if !strings.Contains(r.body, "alice-new") {
+			t.Errorf("expected the returned row, got %s", r.body)
+		}
+		var n int
+		if err := env.pool.DB.GetContext(bg, &n, "SELECT count(*) FROM "+docs+" WHERE id = 100"); err != nil {
+			t.Fatalf("verify: %v", err)
+		}
+		if n != 1 {
+			t.Fatalf("row 100 not persisted (count=%d)", n)
+		}
+	})
+
+	t.Run("insert without returning -> affected count", func(t *testing.T) {
+		r := post(t, srv, fmt.Sprintf("INSERT INTO %s (id, body) VALUES (102, 'alice-two')", docs), hdr)
+		if r.status != http.StatusOK {
+			t.Fatalf("status=%d body=%s", r.status, r.body)
+		}
+		if !strings.Contains(r.body, `"affected":1`) {
+			t.Errorf("expected affected count, got %s", r.body)
+		}
+	})
+
+	t.Run("update without returning -> affected count", func(t *testing.T) {
+		r := post(t, srv, fmt.Sprintf("UPDATE %s SET body = 'edited' WHERE id = 100", docs), hdr)
+		if r.status != http.StatusOK {
+			t.Fatalf("status=%d body=%s", r.status, r.body)
+		}
+		if !strings.Contains(r.body, `"affected":1`) {
+			t.Errorf("expected affected count, got %s", r.body)
+		}
+	})
+
+	t.Run("cross-tenant write blocked by WITH CHECK", func(t *testing.T) {
+		// owner != current_user violates the INSERT WITH CHECK policy, so the write
+		// is rejected and nothing persists.
+		r := post(t, srv, fmt.Sprintf("INSERT INTO %s (id, owner, body) VALUES (103, 'someone_else', 'x') RETURNING id", docs), hdr)
+		if r.status == http.StatusOK {
+			t.Fatalf("cross-tenant write unexpectedly succeeded: %s", r.body)
+		}
+		var n int
+		if err := env.pool.DB.GetContext(bg, &n, "SELECT count(*) FROM "+docs+" WHERE id = 103"); err != nil {
+			t.Fatalf("verify: %v", err)
+		}
+		if n != 0 {
+			t.Fatalf("WITH CHECK enforcement failed: row 103 was inserted")
+		}
+	})
+
+	t.Run("over-cap write rolled back", func(t *testing.T) {
+		// Alice owns several rows (the two seeded plus those inserted above), so an
+		// unqualified UPDATE affects more than one row. With the cap at 1 it is
+		// rolled back before commit.
+		cfg.Limits.MaxAffectedRows = 1
+		defer func() { cfg.Limits.MaxAffectedRows = 0 }()
+
+		r := post(t, srv, fmt.Sprintf("UPDATE %s SET body = 'capped'", docs), hdr)
+		if r.status != http.StatusBadRequest {
+			t.Fatalf("status=%d body=%s, want 400", r.status, r.body)
+		}
+		if !strings.Contains(r.body, "exceeds the configured limit") {
+			t.Errorf("unexpected body: %s", r.body)
+		}
+		// Nothing was changed: no row has the 'capped' body.
+		var n int
+		if err := env.pool.DB.GetContext(bg, &n, "SELECT count(*) FROM "+docs+" WHERE body = 'capped'"); err != nil {
+			t.Fatalf("verify: %v", err)
+		}
+		if n != 0 {
+			t.Fatalf("over-cap write was not rolled back: %d rows changed", n)
+		}
+	})
 }
 
 // basicAuth builds an HTTP Basic Authorization header value.

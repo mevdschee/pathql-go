@@ -36,7 +36,17 @@ type QueryOptions struct {
 	// MaxEstimatedRows, when > 0, rejects the query if the planner's estimated
 	// output row count exceeds this (same EXPLAIN pre-check). 0 disables.
 	MaxEstimatedRows int64
+	// MaxAffectedRows, when > 0, is the write blast-radius cap: RunWrite rolls the
+	// transaction back with ErrTooManyRowsAffected if a write affects (or, for a
+	// RETURNING write, returns) more rows than this. 0 disables.
+	MaxAffectedRows int64
 }
+
+// ErrTooManyRowsAffected is returned by RunWrite when a write affects more rows
+// than QueryOptions.MaxAffectedRows allows. The write is rolled back before
+// commit, so nothing persists. The wrapping error carries the actual count for
+// server logs; callers map the sentinel to a 4xx with a generic client message.
+var ErrTooManyRowsAffected = errors.New("write rejected: affected row count exceeds the configured limit")
 
 // ErrQueryTooExpensive is returned by RunQuery when the proactive cost ceiling
 // rejects a query: its PostgreSQL planner estimate (total cost or output rows,
@@ -179,6 +189,94 @@ func RunQuery(ctx context.Context, pool *pathsqlx.DB, query string, params inter
 	result, err := pool.PathQueryTx(ctx, tx, query, params, hints)
 	if err != nil {
 		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	committed = true
+	return result, nil
+}
+
+// RunWrite executes a data-modifying statement (INSERT/UPDATE/DELETE, or a WITH
+// wrapping one) inside a read-write transaction. It mirrors RunQuery - same
+// transaction-local session settings (applySessionSettings) and the same
+// proactive EXPLAIN cost ceiling (enforceCostCeiling) - and differs only in the
+// transaction mode and the return shape:
+//
+//   - hasReturning true: the statement is run through pathsqlx, so the RETURNING
+//     columns come back as JSON (a flat array by default, or shaped by hints).
+//   - hasReturning false: the statement is executed and the result is
+//     {"affected": N}, the rows-affected count.
+//
+// When opts.MaxAffectedRows > 0 the affected count is checked before commit and
+// the transaction is rolled back with ErrTooManyRowsAffected if it is exceeded.
+// The count is exact for the non-RETURNING path (RowsAffected) and for the
+// default flat RETURNING shape (the number of returned rows); a RETURNING result
+// reshaped by hints into a non-array cannot be counted post hoc, so for that case
+// the cap relies on the pre-execution MaxEstimatedRows ceiling instead.
+//
+// PostgreSQL is the primary target (RETURNING and the EXPLAIN ceiling are
+// Postgres features); the affected-count path is driver-agnostic.
+func RunWrite(ctx context.Context, pool *pathsqlx.DB, query string, params interface{}, hints map[string]string, opts QueryOptions, hasReturning bool) (interface{}, error) {
+	tx, err := pool.BeginTxx(ctx, &sql.TxOptions{ReadOnly: false})
+	if err != nil {
+		return nil, err
+	}
+
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	if err := applySessionSettings(ctx, tx, opts); err != nil {
+		return nil, err
+	}
+
+	if err := enforceCostCeiling(ctx, tx, query, params, opts.MaxEstimatedCost, opts.MaxEstimatedRows); err != nil {
+		return nil, err
+	}
+
+	var result interface{}
+	var affected int64
+	knownAffected := false
+
+	if hasReturning {
+		result, err = pool.PathQueryTx(ctx, tx, query, params, hints)
+		if err != nil {
+			return nil, err
+		}
+		// The default (un-hinted) RETURNING result is a flat array; its length is
+		// the number of rows the write touched. A hinted, reshaped result is not an
+		// array, so the post-hoc count is skipped and the cap relies on the EXPLAIN
+		// estimate.
+		if rows, ok := result.([]interface{}); ok {
+			affected = int64(len(rows))
+			knownAffected = true
+		}
+	} else {
+		p := params
+		if p == nil {
+			p = map[string]interface{}{}
+		}
+		q, args, nerr := sqlx.Named(query, p)
+		if nerr != nil {
+			return nil, nerr
+		}
+		q = tx.Rebind(q)
+		res, eerr := tx.ExecContext(ctx, q, args...)
+		if eerr != nil {
+			return nil, eerr
+		}
+		affected, _ = res.RowsAffected()
+		knownAffected = true
+		result = map[string]interface{}{"affected": affected}
+	}
+
+	if opts.MaxAffectedRows > 0 && knownAffected && affected > opts.MaxAffectedRows {
+		return nil, fmt.Errorf("%w (affected %d > %d)", ErrTooManyRowsAffected, affected, opts.MaxAffectedRows)
 	}
 
 	if err := tx.Commit(); err != nil {

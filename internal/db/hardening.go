@@ -44,7 +44,15 @@ func (r *HardeningReport) Empty() bool { return len(r.Critical) == 0 && len(r.Wa
 // operator asked to enforce it) or a Warning. The caller sets it when
 // identity_kind is login_role and startup_checks is enforce, so a silent
 // full-table exposure aborts startup only where RLS is actually relied upon.
-func VerifyHardening(ctx context.Context, pool *pathsqlx.DB, driver, authTablePrefix string, noRLSIsCritical bool) (*HardeningReport, error) {
+//
+// writesEnabled changes how a write privilege is judged. When writes are off the
+// server promises read-only, so any write grant is Critical. When writes are on
+// a write grant is expected and is not itself a finding; instead, where RLS is
+// the enforced boundary (writeRLSIsCritical), a writable table that lacks a
+// WITH CHECK policy is Critical, since RLS without WITH CHECK filters which rows
+// a write can see but not which it can create or change - a silent cross-tenant
+// write path.
+func VerifyHardening(ctx context.Context, pool *pathsqlx.DB, driver, authTablePrefix string, noRLSIsCritical, writesEnabled, writeRLSIsCritical bool) (*HardeningReport, error) {
 	rep := &HardeningReport{}
 	if driver != "postgres" {
 		return rep, nil
@@ -83,10 +91,46 @@ LIMIT 25`, like)
 	if err != nil {
 		return nil, fmt.Errorf("hardening: write-privilege check: %w", err)
 	}
-	if len(writable) > 0 {
+	if len(writable) > 0 && !writesEnabled {
+		// Writes are off, so the server promises read-only: any write grant
+		// contradicts that and is critical.
 		rep.Critical = append(rep.Critical,
 			fmt.Sprintf("connected role can write (INSERT/UPDATE/DELETE) to %d table(s): %s - grant it only SELECT",
 				len(writable), strings.Join(writable, ", ")))
+	}
+
+	// With writes enabled and RLS the enforced boundary, a writable table needs a
+	// WITH CHECK policy or a caller could create/update rows attributed to another
+	// tenant. Report writable tables that have no WITH CHECK policy at all. The
+	// caller escalates to critical only under login_role + enforce
+	// (writeRLSIsCritical); otherwise it is a warning.
+	if len(writable) > 0 && writesEnabled {
+		noWithCheck, err := scanStrings(ctx, db, `
+SELECT n.nspname || '.' || c.relname
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('r','p')
+  AND n.nspname NOT IN ('pg_catalog','information_schema')
+  AND n.nspname !~ '^pg_'
+  AND c.relname NOT LIKE $1
+  AND (has_table_privilege(c.oid,'INSERT') OR has_table_privilege(c.oid,'UPDATE'))
+  AND NOT EXISTS (
+    SELECT 1 FROM pg_policy p
+    WHERE p.polrelid = c.oid AND p.polwithcheck IS NOT NULL
+  )
+ORDER BY 1
+LIMIT 50`, like)
+		if err != nil {
+			return nil, fmt.Errorf("hardening: with-check coverage check: %w", err)
+		}
+		if len(noWithCheck) > 0 {
+			finding := fmt.Sprintf("%d writable table(s) have NO row-level-security WITH CHECK policy, so a caller could insert or update rows attributed to another identity: %s - add FOR INSERT/UPDATE policies WITH CHECK",
+				len(noWithCheck), strings.Join(noWithCheck, ", "))
+			if writeRLSIsCritical {
+				rep.Critical = append(rep.Critical, finding)
+			} else {
+				rep.Warnings = append(rep.Warnings, finding)
+			}
+		}
 	}
 
 	dangerous, err := scanStrings(ctx, db, `

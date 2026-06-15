@@ -223,6 +223,59 @@ func TestLoad_LoginRoleValidation(t *testing.T) {
 	}
 }
 
+func TestLoad_Writes(t *testing.T) {
+	t.Run("defaults to off", func(t *testing.T) {
+		cfg, err := Load(writeTemp(t, minimalValid))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.Security.Writes != "off" {
+			t.Errorf("Writes = %q, want off", cfg.Security.Writes)
+		}
+		if cfg.WritesEnabled() {
+			t.Error("WritesEnabled() = true, want false by default")
+		}
+	})
+
+	t.Run("on is valid and enables writes", func(t *testing.T) {
+		content := minimalValid + "\n[security]\nwrites = \"on\"\n[limits]\nmax_affected_rows = 1000\n"
+		cfg, err := Load(writeTemp(t, content))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !cfg.WritesEnabled() {
+			t.Error("WritesEnabled() = false, want true")
+		}
+		if cfg.Limits.MaxAffectedRows != 1000 {
+			t.Errorf("MaxAffectedRows = %d, want 1000", cfg.Limits.MaxAffectedRows)
+		}
+	})
+
+	t.Run("on conflicts with read_only", func(t *testing.T) {
+		content := minimalValid + "\n[security]\nwrites = \"on\"\nread_only = true\n"
+		_, err := Load(writeTemp(t, content))
+		if err == nil || !strings.Contains(err.Error(), "writes") {
+			t.Fatalf("got %v, want error mentioning writes/read_only conflict", err)
+		}
+	})
+
+	t.Run("invalid value rejected", func(t *testing.T) {
+		content := minimalValid + "\n[security]\nwrites = \"yes\"\n"
+		_, err := Load(writeTemp(t, content))
+		if err == nil || !strings.Contains(err.Error(), "writes") {
+			t.Fatalf("got %v, want error mentioning writes", err)
+		}
+	})
+
+	t.Run("negative max_affected_rows rejected", func(t *testing.T) {
+		content := minimalValid + "\n[limits]\nmax_affected_rows = -1\n"
+		_, err := Load(writeTemp(t, content))
+		if err == nil || !strings.Contains(err.Error(), "max_affected_rows") {
+			t.Fatalf("got %v, want error mentioning max_affected_rows", err)
+		}
+	})
+}
+
 func TestLoad_DSNEnvExpansion(t *testing.T) {
 	t.Setenv("PATHQL_DB_PASSWORD", "s3cr3t")
 	content := `

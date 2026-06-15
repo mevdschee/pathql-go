@@ -108,3 +108,53 @@ CREATE POLICY documents_owner_select
 --   SET LOCAL ROLE pathql_r_2;   -- impersonate a managed login role
 --   SELECT * FROM documents;     -- only that role's rows
 -- ROLLBACK;
+
+-- ---------------------------------------------------------------------------
+-- 5. OPTIONAL: writes (only when security.writes = "on").
+-- ---------------------------------------------------------------------------
+-- Everything above is read-only and is all most deployments need. The block
+-- below is OFF by default; apply it only if you set security.writes = "on" and
+-- want the per-user roles to INSERT/UPDATE/DELETE through pathql-server.
+--
+-- The critical part is the WITH CHECK clause. A SELECT policy's USING clause
+-- filters which rows a caller can SEE; it does NOT constrain which rows a caller
+-- can CREATE or CHANGE. Without WITH CHECK, a caller could insert a row owned by
+-- another role, or update a row to hand it to another role - a cross-tenant write
+-- hole. WITH CHECK applies the same owner = current_user test to the NEW row, so
+-- a caller can only write rows that remain its own.
+--
+-- Grant the writes (in addition to the SELECT granted in section 1):
+-- GRANT INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO pathql_readers;
+-- ALTER DEFAULT PRIVILEGES IN SCHEMA public
+--   GRANT INSERT, UPDATE, DELETE ON TABLES TO pathql_readers;
+--
+-- Then add per-command policies with WITH CHECK on the new row:
+-- DROP POLICY IF EXISTS documents_owner_insert ON documents;
+-- CREATE POLICY documents_owner_insert
+--   ON documents
+--   FOR INSERT
+--   TO pathql_readers
+--   WITH CHECK (owner = current_user);
+--
+-- DROP POLICY IF EXISTS documents_owner_update ON documents;
+-- CREATE POLICY documents_owner_update
+--   ON documents
+--   FOR UPDATE
+--   TO pathql_readers
+--   USING (owner = current_user)        -- the rows the caller may target
+--   WITH CHECK (owner = current_user);  -- the rows it may leave behind
+--
+-- DROP POLICY IF EXISTS documents_owner_delete ON documents;
+-- CREATE POLICY documents_owner_delete
+--   ON documents
+--   FOR DELETE
+--   TO pathql_readers
+--   USING (owner = current_user);
+--
+-- A common pattern is to default the owner column to the connected role so a
+-- client never has to send it:
+-- ALTER TABLE documents ALTER COLUMN owner SET DEFAULT current_user;
+--
+-- With security.startup_checks = "enforce" under login_role, the server refuses
+-- to start if a writable table has no WITH CHECK policy, so a missing policy here
+-- is caught at boot rather than becoming a silent cross-tenant write.

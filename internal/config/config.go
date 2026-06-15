@@ -92,6 +92,14 @@ type Security struct {
 	// XSRF-TOKEN cookie in an X-XSRF-TOKEN header. Defense in depth for browser
 	// deployments that authenticate with cookies or HTTP Basic.
 	XSRF string `toml:"xsrf"`
+	// Writes is the master switch for data-modifying statements: "off" (default)
+	// keeps the server read-only (every query runs in a READ ONLY transaction);
+	// "on" admits a single INSERT/UPDATE/DELETE (or a WITH wrapping one), which
+	// runs in a read-write transaction, while reads still run READ ONLY. Writes
+	// are only tenant-isolated under identity_kind = "login_role" with RLS
+	// WITH CHECK policies; under "none" they are trusted single-tenant (a startup
+	// warning is logged). It must not be combined with read_only = true.
+	Writes string `toml:"writes"`
 }
 
 // Auth selects the enabled authentication methods.
@@ -131,6 +139,11 @@ type Limits struct {
 	// MaxEstimatedRows, when > 0, rejects a query whose planner estimated output
 	// row count exceeds this (same EXPLAIN pre-check). 0 disables. PostgreSQL only.
 	MaxEstimatedRows int64 `toml:"max_estimated_rows"`
+	// MaxAffectedRows, when > 0, is the write blast-radius cap: a write that
+	// affects (or, for a RETURNING write, returns) more rows than this is rolled
+	// back before commit and rejected with 400. 0 disables. Applies only when
+	// security.writes = "on".
+	MaxAffectedRows int64 `toml:"max_affected_rows"`
 }
 
 // Cache configures the in-process abuse-protection / JWKS cache. The cache is
@@ -293,6 +306,9 @@ func (c *Config) applyDefaults() {
 	if c.Security.XSRF == "" {
 		c.Security.XSRF = "off"
 	}
+	if c.Security.Writes == "" {
+		c.Security.Writes = "off"
+	}
 
 	if c.Roles.BaselineRole == "" {
 		c.Roles.BaselineRole = "pathql_auth"
@@ -433,6 +449,20 @@ func (c *Config) validate() error {
 		return fmt.Errorf("config: xsrf %q must be one of off, on", c.Security.XSRF)
 	}
 
+	switch c.Security.Writes {
+	case "off":
+		// supported
+	case "on":
+		// Writes and a forced read-only transaction are contradictory: the
+		// read-only transaction would block every write at the database. Make the
+		// operator pick one model explicitly rather than silently fail every write.
+		if c.Security.ReadOnly {
+			return fmt.Errorf("config: security.writes = on conflicts with read_only = true; set read_only = false to allow writes")
+		}
+	default:
+		return fmt.Errorf("config: writes %q must be one of off, on", c.Security.Writes)
+	}
+
 	switch c.Security.IdentityKind {
 	case "none":
 		// The simple on-ramp: one shared connection (the top-level dsn), no RLS.
@@ -479,6 +509,9 @@ func (c *Config) validate() error {
 	if c.Limits.MaxEstimatedRows < 0 {
 		return fmt.Errorf("config: limits.max_estimated_rows must be >= 0 (0 disables)")
 	}
+	if c.Limits.MaxAffectedRows < 0 {
+		return fmt.Errorf("config: limits.max_affected_rows must be >= 0 (0 disables)")
+	}
 
 	if c.TLS.Enabled {
 		if c.TLS.CertFile == "" || c.TLS.KeyFile == "" {
@@ -514,6 +547,10 @@ func (c *Config) validateJWT() error {
 	}
 	return nil
 }
+
+// WritesEnabled reports whether data-modifying statements are admitted
+// (security.writes = "on").
+func (c *Config) WritesEnabled() bool { return c.Security.Writes == "on" }
 
 // knownWeakRoleSecrets are placeholder, demo, and obviously-guessable values that
 // must never be used as a real roles.password_secret. Keys are lowercased; the

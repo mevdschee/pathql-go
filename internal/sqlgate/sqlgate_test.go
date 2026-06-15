@@ -118,3 +118,110 @@ func TestCheckUnknownModeFailsClosed(t *testing.T) {
 		t.Error("Check with unknown mode allowed a catalog query; want fail-closed rejection")
 	}
 }
+
+func TestClassifyReads(t *testing.T) {
+	reads := []struct{ name, query string }{
+		{"simple select", "SELECT id FROM posts"},
+		{"lower case", "select 1"},
+		{"trailing semicolon", "SELECT 1;"},
+		{"table statement", "TABLE posts"},
+		{"values statement", "VALUES (1), (2)"},
+		{"leading paren / set op", "(SELECT id FROM a) UNION (SELECT id FROM b)"},
+		{"insert keyword in string is read", "SELECT 'INSERT INTO' AS x"},
+	}
+	for _, tc := range reads {
+		got, err := Classify(tc.query)
+		if err != nil {
+			t.Errorf("%s: Classify(%q) error = %v, want nil", tc.name, tc.query, err)
+			continue
+		}
+		if got != ClassRead {
+			t.Errorf("%s: Classify(%q) = %v, want ClassRead", tc.name, tc.query, got)
+		}
+	}
+}
+
+func TestClassifyWrites(t *testing.T) {
+	writes := []struct{ name, query string }{
+		{"insert", "INSERT INTO posts (content) VALUES ('x')"},
+		{"insert returning", "INSERT INTO posts (content) VALUES ('x') RETURNING id"},
+		{"update", "UPDATE posts SET content = 'x' WHERE id = :id"},
+		{"delete", "DELETE FROM posts WHERE id = :id"},
+		{"lower case insert", "insert into posts (content) values ('x')"},
+		// WITH is conservatively a write (it may wrap a modifying CTE); it runs in
+		// a read-write transaction where a read-only WITH is still valid.
+		{"with select", "WITH recent AS (SELECT id FROM posts) SELECT * FROM recent"},
+		{"with modifying cte", "WITH d AS (DELETE FROM posts WHERE id = 1 RETURNING id) SELECT * FROM d"},
+	}
+	for _, tc := range writes {
+		got, err := Classify(tc.query)
+		if err != nil {
+			t.Errorf("%s: Classify(%q) error = %v, want nil", tc.name, tc.query, err)
+			continue
+		}
+		if got != ClassWrite {
+			t.Errorf("%s: Classify(%q) = %v, want ClassWrite", tc.name, tc.query, got)
+		}
+	}
+}
+
+func TestClassifyRejected(t *testing.T) {
+	rejected := []struct {
+		name, query string
+		want        error
+	}{
+		{"empty", "", errEmpty},
+		{"comment only", "-- just a comment", errEmpty},
+		{"stacked statements", "INSERT INTO t VALUES (1); DROP TABLE t", errMultiple},
+		{"stacked selects", "SELECT 1; SELECT 2", errMultiple},
+		{"truncate", "TRUNCATE posts", errNotAllowed},
+		{"create", "CREATE TABLE x (id int)", errNotAllowed},
+		{"drop", "DROP TABLE posts", errNotAllowed},
+		{"alter", "ALTER TABLE posts ADD COLUMN x int", errNotAllowed},
+		{"grant", "GRANT SELECT ON posts TO bob", errNotAllowed},
+		{"set", "SET work_mem = '1GB'", errNotAllowed},
+		{"copy", "COPY posts TO STDOUT", errNotAllowed},
+		{"call", "CALL do_something()", errNotAllowed},
+		{"do block", "DO $$ BEGIN END $$", errNotAllowed},
+		{"catalog write", "UPDATE pg_authid SET rolsuper = true", errCatalog},
+		{"catalog read", "SELECT * FROM pg_class", errCatalog},
+		{"information_schema", "SELECT table_name FROM information_schema.tables", errCatalog},
+	}
+	for _, tc := range rejected {
+		_, err := Classify(tc.query)
+		if err == nil {
+			t.Errorf("%s: Classify(%q) = nil, want %v", tc.name, tc.query, tc.want)
+			continue
+		}
+		if err != tc.want {
+			t.Errorf("%s: Classify(%q) = %v, want %v", tc.name, tc.query, err, tc.want)
+		}
+	}
+}
+
+func TestHasReturning(t *testing.T) {
+	with := []string{
+		"INSERT INTO posts (content) VALUES ('x') RETURNING id",
+		"insert into posts (content) values ('x') returning id, content",
+		"DELETE FROM posts WHERE id = 1 RETURNING *",
+		"UPDATE posts SET content = 'x' RETURNING id",
+	}
+	for _, q := range with {
+		if !HasReturning(q) {
+			t.Errorf("HasReturning(%q) = false, want true", q)
+		}
+	}
+	without := []string{
+		"INSERT INTO posts (content) VALUES ('x')",
+		"UPDATE posts SET content = 'x' WHERE id = 1",
+		"SELECT id FROM posts",
+		// "returning" only inside a string literal or comment must not count.
+		"INSERT INTO posts (content) VALUES ('returning soon')",
+		"INSERT INTO posts (content) VALUES ('x') -- returning id",
+	}
+	for _, q := range without {
+		if HasReturning(q) {
+			t.Errorf("HasReturning(%q) = true, want false", q)
+		}
+	}
+}

@@ -38,6 +38,17 @@ paths:
         Executes a SQL query against the configured database and returns the
         result as nested JSON.
 
+        ## Writes
+
+        The server is read-only by default. When `security.writes = "on"` a single
+        `INSERT`/`UPDATE`/`DELETE` (or a `WITH` wrapping one) is also accepted: a
+        statement with `RETURNING` returns the written rows (flat, or shaped by
+        `paths`), and a statement without `RETURNING` returns `{"affected": N}`.
+        Writes that affect more than `limits.max_affected_rows` rows are rolled
+        back and rejected with 400. Anything that is neither a read nor a single
+        write (DDL, `TRUNCATE`, `COPY`, stacked statements, system catalogs) is
+        rejected with 400.
+
         ## Authentication
 
         Send one of: the `X-API-Key` header (or `Authorization: ApiKey <key>`),
@@ -86,6 +97,21 @@ paths:
                   paths:
                     p: "$"
                     c: "$.comments[]"
+              writeReturning:
+                summary: Write returning the new row (writes = "on")
+                value:
+                  query: "INSERT INTO posts (content) VALUES (:content) RETURNING id, content"
+                  params:
+                    content: "hello"
+                  paths:
+                    "$": "$"
+              writeAffected:
+                summary: Write returning an affected-row count (writes = "on")
+                value:
+                  query: "UPDATE posts SET content = :content WHERE id = :id"
+                  params:
+                    content: "edited"
+                    id: 3
       responses:
         "200":
           description: Query executed successfully
@@ -124,11 +150,17 @@ paths:
                 emptyResult:
                   summary: Empty result set
                   value: []
+                affectedCount:
+                  summary: Write without RETURNING (writes = "on")
+                  value:
+                    affected: 1
         "400":
           description: >
-            Bad request: malformed body, bad params, a SQL-gate rejection, or a
+            Bad request: malformed body, bad params, a SQL-gate or classifier
+            rejection (a statement that is neither a read nor a single write), a
             query rejected by the proactive cost ceiling (its EXPLAIN estimate
-            exceeded max_estimated_cost / max_estimated_rows).
+            exceeded max_estimated_cost / max_estimated_rows), or a write rolled
+            back for exceeding max_affected_rows.
           content:
             application/json:
               schema:
@@ -154,6 +186,11 @@ paths:
                   value:
                     type: "Error"
                     message: "query rejected: estimated cost or row count exceeds the configured limit"
+                affectedRowsCap:
+                  summary: Write rejected for exceeding max_affected_rows
+                  value:
+                    type: "Error"
+                    message: "write rejected: affected row count exceeds the configured limit"
         "401":
           description: Missing or invalid credentials
           headers:
@@ -514,13 +551,19 @@ components:
             c: "$.comments[]"
 
     QueryResponse:
-      type: array
       description: |
-        Array of result objects. Each object represents a row from the query result.
-        The structure depends on the columns returned by the query.
-      items:
-        type: object
-        additionalProperties: true
+        The query result. A read returns an array of row objects, or - with PATH
+        hints - a nested object. A write with RETURNING returns its rows the same
+        way; a write without RETURNING returns an object with an `affected` count
+        ({"affected": N}). The structure otherwise depends on the columns and any
+        PATH hints.
+      oneOf:
+        - type: array
+          items:
+            type: object
+            additionalProperties: true
+        - type: object
+          additionalProperties: true
       example:
         - id: 1
           name: "Alice"

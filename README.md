@@ -106,6 +106,7 @@ metrics_user                = "metrics"
 startup_checks              = "warn"
 sql_gate                    = "off"    # "off" or "on" (see SQL gate)
 xsrf                        = "off"    # "off" or "on" (see XSRF / CSRF protection)
+writes                      = "off"    # "off" or "on" (see Writes)
 # admin_user                = "admin"
 # trusted_proxies = ["10.0.0.0/8", "192.168.0.0/16"]
 # allow_ips = ["10.0.0.0/8"]           # IP firewall allowlist (see IP firewall)
@@ -135,6 +136,7 @@ max_auth_failures_per_min = 60
 work_mem_kb               = 0
 max_estimated_cost        = 0          # EXPLAIN cost ceiling; 0 disables (Postgres only)
 max_estimated_rows        = 0          # EXPLAIN estimated-rows ceiling; 0 disables
+max_affected_rows         = 0          # write blast-radius cap; 0 disables (see Writes)
 
 [timeouts]
 read_ms  = 10000
@@ -183,6 +185,7 @@ Section options:
   `startup_checks` controls the [startup hardening check](#startup-hardening-checks).
   `sql_gate` enables the optional pre-execution [SQL gate](#sql-gate).
   `xsrf` enables the optional [XSRF / CSRF protection](#xsrf--csrf-protection).
+  `writes` enables optional [write support](#writes) (off by default).
   `trusted_proxies` is a list of CIDRs (or bare IPs) whose `RemoteAddr` is
   trusted to set `X-Forwarded-For` / `X-Real-IP`; the rate limiter (and the IP
   firewall) use it to find the real client IP. `allow_ips` and `deny_ips` are the
@@ -203,7 +206,8 @@ Section options:
   abuse-protection caps, see
   [Rate limiting and concurrency](#rate-limiting-and-concurrency).
   `max_estimated_cost` and `max_estimated_rows` are the proactive
-  [cost ceiling](#cost-ceiling).
+  [cost ceiling](#cost-ceiling). `max_affected_rows` is the write blast-radius
+  cap (see [Writes](#writes)).
 - **`[timeouts]`**: HTTP server `read_ms`, `write_ms`, and `idle_ms`.
 - **`[cache]`**: the in-process counter/JWKS cache, see [Cache](#cache).
 - **`[tls]`**: optional TLS termination, see [TLS](#tls).
@@ -578,6 +582,105 @@ each request to a single read-only statement, so the EXPLAIN the ceiling runs
 plans exactly that one statement; without it a stacked statement could be planned
 or run during the EXPLAIN step (the read-only transaction still blocks writes,
 but the gate is the cleaner boundary).
+
+## Writes
+
+The server is read-only by default: every query runs in a `READ ONLY`
+transaction and the role is granted only `SELECT`. Set `[security] writes = "on"`
+to also accept data-modifying statements. It is off by default, and it cannot be
+combined with `read_only = true` (that would block every write at the database;
+the server refuses to start on the contradiction).
+
+When writes are on, each request is classified by its leading statement keyword:
+
+- a **read** (`SELECT`/`TABLE`/`VALUES`) runs in a `READ ONLY` transaction,
+  exactly as when writes are off, so enabling writes never relaxes the read path;
+- a **write** (`INSERT`/`UPDATE`/`DELETE`, or a `WITH` wrapping one) runs in a
+  read-write transaction; and
+- anything else (DDL, `TRUNCATE`, `COPY`, `SET`, `SHOW`, `EXPLAIN`, `CALL`, `DO`,
+  stacked statements, system-catalog access) is rejected with `400`.
+
+Classification applies the same structural rules as the [SQL gate](#sql-gate) (a
+single statement over non-catalog objects) regardless of the `sql_gate` setting,
+so admitting writes never also admits stacked statements or catalog access.
+
+### Response shape
+
+- A write **with `RETURNING`** returns the written rows as JSON, subject to
+  `max_response_bytes`. pathsqlx infers nesting from a `SELECT ... FROM` shape, so
+  it does not auto-nest a write: the `RETURNING` columns come back under their
+  bare names (a flat array). Shape the response with `paths` hints, exactly as for
+  a read (for example `"paths": {"$": "$"}`).
+- A write **without `RETURNING`** returns `{"affected": N}`, the number of rows
+  changed.
+
+`RETURNING` is PostgreSQL syntax (full `INSERT`/`UPDATE`/`DELETE`); MariaDB
+supports it only for `INSERT` and `DELETE`. The affected-count path works on any
+driver.
+
+### Blast-radius cap
+
+`[limits] max_affected_rows` (0 disables, the default) is the write-side analogue
+of the [cost ceiling](#cost-ceiling). A write that affects (or, with `RETURNING`,
+returns) more rows than the cap is rolled back before commit and rejected with
+`400`; the actual count is logged server-side, not returned. The pre-execution
+`max_estimated_rows` ceiling also applies, so an obviously unbounded `UPDATE`/
+`DELETE` is stopped before it runs.
+
+### Tenant isolation for writes
+
+Writes are only tenant-isolated under
+[`identity_kind = "login_role"`](#row-level-security), where the connected role is
+the caller's own. RLS read policies are not enough: a `USING` clause filters which
+rows a write can *see*, but only a `WITH CHECK` clause constrains which rows a
+caller can *create or change*. Without `WITH CHECK`, a caller could insert or
+update a row attributed to another tenant. Add `FOR INSERT`/`FOR UPDATE` policies
+with `WITH CHECK (owner = current_user)` (and a `FOR DELETE` policy with `USING`);
+see the optional writer block in
+[examples/rls_policy.sql](examples/rls_policy.sql). Under `login_role` with
+`startup_checks = "enforce"`, the server refuses to start when a writable table
+has no `WITH CHECK` policy, so a silent cross-tenant write path is caught at boot.
+
+Under `identity_kind = "none"` there is no per-caller identity, so writes are
+trusted single-tenant: every authenticated caller writes as the same role with no
+row-level authorization. The server logs a warning at startup in that case. For
+browser deployments that authenticate with cookies or HTTP Basic, enable
+[`xsrf = "on"`](#xsrf--csrf-protection) once writes are accepted.
+
+### Example: insert returning the new row
+
+**Request:**
+
+```json
+{
+  "query": "INSERT INTO posts (content) VALUES (:content) RETURNING id, content",
+  "params": { "content": "hello" },
+  "paths": { "$": "$" }
+}
+```
+
+**Response:**
+
+```json
+{ "id": 3, "content": "hello" }
+```
+
+### Example: update without RETURNING
+
+**Request:**
+
+```json
+{
+  "query": "UPDATE posts SET content = :content WHERE id = :id",
+  "params": { "content": "edited", "id": 3 }
+}
+```
+
+**Response:**
+
+```json
+{ "affected": 1 }
+```
 
 ## Testing
 

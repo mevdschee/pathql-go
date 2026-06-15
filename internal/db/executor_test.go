@@ -42,6 +42,9 @@ type recorder struct {
 	// any query beginning with "EXPLAIN", so the cost-ceiling path can be exercised
 	// without a real planner.
 	explainJSON []byte
+	// execAffected is the RowsAffected count every Exec reports, so the write
+	// blast-radius cap (RunWrite) can be exercised without a real table.
+	execAffected int64
 }
 
 func (r *recorder) record(query string, args []driver.Value) {
@@ -118,7 +121,10 @@ func (s recStmt) Exec(args []driver.Value) (driver.Result, error) {
 	if fe != nil {
 		return nil, fe
 	}
-	return driver.RowsAffected(0), nil
+	s.rec.mu.Lock()
+	n := s.rec.execAffected
+	s.rec.mu.Unlock()
+	return driver.RowsAffected(n), nil
 }
 
 func (s recStmt) Query(args []driver.Value) (driver.Rows, error) {
@@ -180,6 +186,7 @@ func openRecordingTx(t *testing.T, readOnly bool) (*sqlx.Tx, *recorder, func()) 
 	sharedRecorder.rollbacks = 0
 	sharedRecorder.failErr = nil
 	sharedRecorder.explainJSON = nil
+	sharedRecorder.execAffected = 0
 	sharedRecorder.mu.Unlock()
 
 	sdb, err := sql.Open(recDriverName, "")
@@ -454,6 +461,123 @@ func TestEnforceCostCeiling_RejectsOverBudget(t *testing.T) {
 	}
 	if !sawExplain {
 		t.Error("expected an EXPLAIN (FORMAT JSON) statement to be issued")
+	}
+}
+
+// --- RunWrite (non-RETURNING path) -----------------------------------------
+//
+// The RETURNING path calls PathQueryTx, which needs a real schema, so the
+// hermetic tests cover only the affected-count path here; RETURNING is covered
+// by the e2e suite against a live Postgres.
+
+// newRecordingPool resets the shared recorder, applies any per-test setup, and
+// returns a pathsqlx pool on the recording driver.
+func newRecordingPool(t *testing.T, setup func(r *recorder)) *pathsqlx.DB {
+	t.Helper()
+	sharedRecorder.mu.Lock()
+	sharedRecorder.stmts = nil
+	sharedRecorder.begins = 0
+	sharedRecorder.commits = 0
+	sharedRecorder.rollbacks = 0
+	sharedRecorder.failErr = nil
+	sharedRecorder.explainJSON = nil
+	sharedRecorder.execAffected = 0
+	if setup != nil {
+		setup(sharedRecorder)
+	}
+	sharedRecorder.mu.Unlock()
+	t.Cleanup(func() {
+		sharedRecorder.mu.Lock()
+		sharedRecorder.failErr = nil
+		sharedRecorder.explainJSON = nil
+		sharedRecorder.execAffected = 0
+		sharedRecorder.mu.Unlock()
+	})
+
+	sdb, err := sql.Open(recDriverName, "")
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	pool := pathsqlx.NewDb(sdb, recDriverName)
+	t.Cleanup(func() { _ = pool.DB.DB.Close() })
+	return pool
+}
+
+func TestRunWrite_NonReturningReturnsAffectedAndCommits(t *testing.T) {
+	pool := newRecordingPool(t, func(r *recorder) { r.execAffected = 3 })
+
+	res, err := RunWrite(context.Background(), pool,
+		"UPDATE posts SET content = 'x'", nil, nil, QueryOptions{}, false)
+	if err != nil {
+		t.Fatalf("RunWrite: %v", err)
+	}
+	m, ok := res.(map[string]interface{})
+	if !ok {
+		t.Fatalf("result type = %T, want map[string]interface{}", res)
+	}
+	if m["affected"] != int64(3) {
+		t.Errorf("affected = %v, want 3", m["affected"])
+	}
+	sharedRecorder.mu.Lock()
+	defer sharedRecorder.mu.Unlock()
+	if sharedRecorder.commits != 1 {
+		t.Errorf("commits = %d, want 1", sharedRecorder.commits)
+	}
+	if sharedRecorder.rollbacks != 0 {
+		t.Errorf("rollbacks = %d, want 0", sharedRecorder.rollbacks)
+	}
+}
+
+func TestRunWrite_AffectedCapRollsBack(t *testing.T) {
+	pool := newRecordingPool(t, func(r *recorder) { r.execAffected = 100 })
+
+	opts := QueryOptions{MaxAffectedRows: 10}
+	_, err := RunWrite(context.Background(), pool,
+		"DELETE FROM posts", nil, nil, opts, false)
+	if !errors.Is(err, ErrTooManyRowsAffected) {
+		t.Fatalf("err = %v, want ErrTooManyRowsAffected", err)
+	}
+	sharedRecorder.mu.Lock()
+	defer sharedRecorder.mu.Unlock()
+	if sharedRecorder.commits != 0 {
+		t.Errorf("commits = %d, want 0 (an over-cap write must not commit)", sharedRecorder.commits)
+	}
+	if sharedRecorder.rollbacks != 1 {
+		t.Errorf("rollbacks = %d, want 1", sharedRecorder.rollbacks)
+	}
+}
+
+func TestRunWrite_AtCapCommits(t *testing.T) {
+	pool := newRecordingPool(t, func(r *recorder) { r.execAffected = 10 })
+
+	// Exactly at the cap is allowed (the cap rejects only counts strictly above it).
+	opts := QueryOptions{MaxAffectedRows: 10}
+	if _, err := RunWrite(context.Background(), pool,
+		"DELETE FROM posts WHERE id < 11", nil, nil, opts, false); err != nil {
+		t.Fatalf("RunWrite at cap: %v", err)
+	}
+	sharedRecorder.mu.Lock()
+	defer sharedRecorder.mu.Unlock()
+	if sharedRecorder.commits != 1 {
+		t.Errorf("commits = %d, want 1", sharedRecorder.commits)
+	}
+}
+
+func TestRunWrite_RollsBackOnSettingsError(t *testing.T) {
+	pool := newRecordingPool(t, func(r *recorder) { r.failErr = errors.New("set_config failed") })
+
+	opts := QueryOptions{StatementTimeout: time.Second}
+	if _, err := RunWrite(context.Background(), pool,
+		"INSERT INTO posts (content) VALUES ('x')", nil, nil, opts, false); err == nil {
+		t.Fatal("expected error from failing session setting, got nil")
+	}
+	sharedRecorder.mu.Lock()
+	defer sharedRecorder.mu.Unlock()
+	if sharedRecorder.commits != 0 {
+		t.Errorf("commits = %d, want 0 (must not commit on error)", sharedRecorder.commits)
+	}
+	if sharedRecorder.rollbacks != 1 {
+		t.Errorf("rollbacks = %d, want 1", sharedRecorder.rollbacks)
 	}
 }
 
