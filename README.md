@@ -1,5 +1,7 @@
 # pathql-server
 
+Blog post: https://www.tqdev.com/2026-pathql-server-safe-sql-to-json/
+
 PathQL server implementation in Go (see: [PathQL.org](https://pathql.org/)).
 
 PathQL lets you write SQL queries that automatically produce nested JSON from
